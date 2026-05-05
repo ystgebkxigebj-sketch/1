@@ -1,123 +1,130 @@
-name: Gartic (Camoufox, headless, Linux experiment)
+name: Gartic (Camoufox, headless)
 on:
   workflow_dispatch:
 
 jobs:
   gartic-bot:
-    # Linux runner pool is wholly separate from the Windows pools, so when
-    # windows-latest / windows-2022 say "all runners busy" this label often
-    # picks up immediately. Bonus: Linux Camoufox runs slightly hotter than
-    # Windows (no Defender, no Update Orchestrator, no DWM compositing) and
-    # ubuntu-* minutes are billed at 1x vs Windows' 2x.
-    runs-on: ubuntu-24.04
+    runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: 1. Aggressive system tuning (services, CPU, network, FS)
+      - name: 1. Aggressive system tuning (power, Defender, services, FS, network)
         run: |
-          set +e
-          echo "=== Linux system tuning for Camoufox throughput ==="
+          Write-Host "=== System tuning for max throughput on a 4-vCPU runner ==="
 
-          # ---- Stop services that wake to consume CPU ----
-          # snapd is the loudest on Ubuntu runners (polls store + indexes
-          # mounts). unattended-upgrades wakes apt every few minutes.
-          for svc in snapd snapd.socket unattended-upgrades udisks2 \
-                     packagekit ModemManager rsyslog avahi-daemon \
-                     cron multipathd; do
-              sudo systemctl stop    "$svc" 2>/dev/null
-              sudo systemctl disable "$svc" 2>/dev/null
-          done
+          # ---- Memory ----
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name "PagingFiles" -Value "C:\pagefile.sys 20000 20000"
+          Disable-MMAgent -mc -ErrorAction SilentlyContinue
+          powercfg -h off 2>$null
+          Write-Host "Memory: 20GB pagefile, no compression, no hibernation"
 
-          # ---- Disable systemd timers (idle wakers) ----
-          for tmr in apt-daily.timer apt-daily-upgrade.timer \
-                     logrotate.timer fstrim.timer fwupd-refresh.timer \
-                     man-db.timer motd-news.timer ua-timer.timer \
-                     update-notifier-download.timer update-notifier-motd.timer \
-                     dpkg-db-backup.timer e2scrub_all.timer; do
-              sudo systemctl stop    "$tmr" 2>/dev/null
-              sudo systemctl disable "$tmr" 2>/dev/null
-          done
+          # ---- Power plan: keep CPU at max clock, no core parking ----
+          $ultimateGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+          powercfg -duplicatescheme $ultimateGuid 2>$null | Out-Null
+          powercfg /setactive $ultimateGuid 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
+          }
+          powercfg /change standby-timeout-ac 0 2>$null
+          powercfg /change monitor-timeout-ac 0 2>$null
+          powercfg -setacvalueindex SCHEME_CURRENT SUB_PROCESSOR CPMINCORES 100 2>$null
+          powercfg -setacvalueindex SCHEME_CURRENT SUB_PROCESSOR CPMAXCORES 100 2>$null
+          powercfg -setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100 2>$null
+          powercfg /setactive SCHEME_CURRENT 2>$null
+          Write-Host "Power: Ultimate plan, no parking, no throttle"
 
-          # ---- CPU governor: performance (no frequency scaling) ----
-          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-              [ -w "$f" ] && echo performance | sudo tee "$f" >/dev/null
-          done
+          # ---- Defender: full real-time off + belt-and-suspenders exclusions ----
+          Set-MpPreference -DisableRealtimeMonitoring $true   -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableBehaviorMonitoring $true   -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableIOAVProtection $true       -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableScriptScanning $true       -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableArchiveScanning $true      -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableIntrusionPreventionSystem $true -ErrorAction SilentlyContinue
+          Set-MpPreference -MAPSReporting Disabled            -ErrorAction SilentlyContinue
+          Set-MpPreference -SubmitSamplesConsent NeverSend    -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath  "C:\camoufox"                                           -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath  "C:\Users\runneradmin\AppData\Local\camoufox"           -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionProcess "python.exe","firefox.exe","camoufox.exe"            -ErrorAction SilentlyContinue
+          Write-Host "Defender: real-time off, exclusions kept"
 
-          # ---- Disable CPU idle states for deterministic wake latency ----
-          for d in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
-              [ -w "$d" ] && echo 1 | sudo tee "$d" >/dev/null
-          done
+          # ---- Stop background services that wake to consume CPU ----
+          $services = @(
+              "SysMain", "WSearch", "DiagTrack", "wuauserv", "WerSvc", "Spooler",
+              "AudioSrv", "BITS", "lfsvc", "MapsBroker", "RetailDemo",
+              "DPS", "WdiServiceHost", "WdiSystemHost"
+          )
+          foreach ($s in $services) {
+              Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+              Set-Service  -Name $s -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          Write-Host "Background services: stopped + disabled"
 
-          # ---- TCP: BBR congestion control + larger socket buffers ----
-          # BBR is the Linux equivalent of Windows' multimedia-throttle removal:
-          # saturates Cloudflare's edge in fewer RTTs.
-          sudo modprobe tcp_bbr 2>/dev/null
-          sudo sysctl -w net.core.default_qdisc=fq                2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr      2>/dev/null
-          sudo sysctl -w net.core.rmem_max=67108864               2>/dev/null
-          sudo sysctl -w net.core.wmem_max=67108864               2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_rmem='4096 87380 67108864'  2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_wmem='4096 65536 67108864'  2>/dev/null
-          sudo sysctl -w net.ipv4.tcp_fastopen=3                  2>/dev/null
+          # ---- Disable scheduled tasks that wake on idle ----
+          $tasks = @(
+              "\Microsoft\Windows\Defender\Windows Defender Scheduled Scan",
+              "\Microsoft\Windows\Defender\Windows Defender Cleanup",
+              "\Microsoft\Windows\Defender\Windows Defender Verification",
+              "\Microsoft\Windows\Defender\Windows Defender Cache Maintenance",
+              "\Microsoft\Windows\Maintenance\WinSAT",
+              "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
+              "\Microsoft\Windows\Application Experience\ProgramDataUpdater",
+              "\Microsoft\Windows\Application Experience\StartupAppTask",
+              "\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+              "\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip",
+              "\Microsoft\Windows\AppID\SmartScreenSpecific",
+              "\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector",
+              "\Microsoft\Windows\Autochk\Proxy",
+              "\Microsoft\Windows\Windows Error Reporting\QueueReporting",
+              "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan",
+              "\Microsoft\Windows\WindowsUpdate\Scheduled Start"
+          )
+          foreach ($t in $tasks) {
+              schtasks /Change /TN $t /Disable 2>$null | Out-Null
+          }
+          Write-Host "Scheduled tasks: idle-wakers disabled"
 
-          # ---- IPv6 off (gartic + Cloudflare reachable over v4; skips AAAA
-          #      lookups and Happy-Eyeballs racing).
-          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1     2>/dev/null
-          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
+          # ---- Filesystem ----
+          fsutil behavior set disablelastaccess 1 2>$null | Out-Null
+          fsutil behavior set disable8dot3 1 2>$null | Out-Null
 
-          # ---- Filesystem: noatime on root + always-on transparent hugepages ----
-          sudo mount -o remount,noatime / 2>/dev/null
-          [ -w /sys/kernel/mm/transparent_hugepage/enabled ] && \
-              echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null
+          # ---- Network: kill Windows' "multimedia" throttle, max responsiveness ----
+          $mmKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+          Set-ItemProperty -Path $mmKey -Name "NetworkThrottlingIndex" -Value 0xFFFFFFFF -Type DWord -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $mmKey -Name "SystemResponsiveness" -Value 0 -Type DWord -ErrorAction SilentlyContinue
 
-          # ---- Kernel: kill the soft-lockup watchdog (small but real CPU% sink) ----
-          sudo sysctl -w kernel.watchdog=0 2>/dev/null
+          Write-Host "=== System tuning complete ==="
 
-          # ---- Drop the GitHub Actions runner agent priority so Camoufox dominates ----
-          pgrep -f 'Runner\.Listener|Runner\.Worker' \
-              | xargs -r -I{} sudo renice -n 19 -p {} 2>/dev/null
-
-          echo "=== System tuning complete ==="
-
-      - name: 2. Drop Camoufox project files at /opt/camoufox
+      - name: 2. Drop Camoufox project files at C:\camoufox
         run: |
-          sudo mkdir -p /opt/camoufox
-          sudo chown "$USER":"$USER" /opt/camoufox
+          $proj = "C:\camoufox"
+          New-Item -ItemType Directory -Force -Path $proj | Out-Null
 
-          # generator.py is embedded as base64 to keep this YAML self-contained,
-          # byte-for-byte identical to the Windows variants. (Single-quoted so
-          # bash performs no expansion on the b64 alphabet.)
-          GEN_B64='aW1wb3J0IGFzeW5jaW8KaW1wb3J0IHRpbWUKaW1wb3J0IGFpb2h0dHAKZnJvbSBjYW1vdWZveC5hc3luY19hcGkgaW1wb3J0IEFzeW5jQ2Ftb3Vmb3gKCiMgQ2Ftb3Vmb3ggcG9ydCBvZiBAbWFnaWp1ZGFyJ3MgcHVwcGV0ZWVyIHBhdHRlcm4gKHNoaXBzIGV2ZXJ5IHRva2VuIHRvIG1vb25maXZlKQoKTU9PTkZJVkVfVVJMICAgICAgICAgID0gImh0dHBzOi8vbW9vbmZpdmUuYWx3YXlzZGF0YS5uZXQvYWRkLXRva2VuIgpUQVJHRVRfVVJMICAgICAgICAgICAgPSAiaHR0cHM6Ly9nYXJ0aWMuaW8iClNJVEVLRVkgICAgICAgICAgICAgICA9ICIweDRBQUFBQUFCQlBLYUliTnduUEVmU28iCk5VTV9CUk9XU0VSUyAgICAgICAgICA9IDEgICAgICAgICAgICAgICAgICAgICAgICMgc2luZ2xlIENhbW91Zm94IHByb2Nlc3Mg4oCUIGhhbGYgdGhlIE9TIG92ZXJoZWFkIHZzIDIKTlVNX1RBQlMgICAgICAgICAgICAgID0gNiAgICAgICAgICAgICAgICAgICAgICAgIyB0YWJzIHBlciBicm93c2VyIChlYWNoIGdldHMgaXRzIG93biBCcm93c2VyQ29udGV4dCkKTlVNX0xBTkVTICAgICAgICAgICAgID0gNSAgICAgICAgICAgICAgICAgICAgICAgIyBwYXJhbGxlbCB0dXJuc3RpbGUgd2lkZ2V0cyBwZXIgdGFiCkxBTkVfU1RBR0dFUl9NUyAgICAgICA9IDUwMCAgICAgICAgICAgICAgICAgICAgICMgZGVsYXkgYmV0d2VlbiBzdGFydGluZyBlYWNoIGxhbmUgKGF2b2lkcyBidXJzdCkKUkVMT0FEX0lOVEVSVkFMX01TICAgID0gNjAgKiA2MF8wMDAgICAgICAgICAgICAgIyBlZmZlY3RpdmVseSBkaXNhYmxlZCDigJQgd2lkZ2V0cyByZXNldCgpIGluIHBsYWNlCkJST1dTRVJfTElGRVRJTUVfTVMgICA9IDUwICogNjBfMDAwICAgICAgICAgICAgICMgfjUwIG1pbiBsaWZldGltZTsgcmVsb2FkIHdvdWxkIG5ldmVyIGZpcmUgZmlyc3QKCiMgQ291bnRlcnMgZm9yIHRva2VuLXZlcnNpb24gZGlhZ25vc3RpY3MuIENsb3VkZmxhcmUncyBsZWFkaW5nICIwLiIvIjEuIiBwcmVmaXgKIyBpcyBpdHMgaW50ZXJuYWwgcm90YXRpb24vdmVyc2lvbiAoTk9UIGEgcmlzayBzY29yZSkg4oCUIGJvdGggcGFzcyBzaXRldmVyaWZ5LgojIFRoZSBpY2Vib3QgR28gc2VydmVyJ3Mgb2xkIGhhcmRjb2RlZCBgWzoyXSAhPSAiMS4iYCBmaWx0ZXIgYXQgdHVybnN0aWxlLmdvOjc5CiMgc2lsZW50bHkgcmVqZWN0ZWQgZXZlcnkgIjAuIiB0b2tlbiB1bnRpbCAyMDI2LTA1LTA0OyBsb2dnaW5nIGJvdGggbGV0cyB1cwojIHNwb3QgYSByZWdyZXNzaW9uIHRoZXJlIGltbWVkaWF0ZWx5LgpfbGV2ZWxfY291bnRzID0geyIwIjogMCwgIjEiOiAwLCAib3RoZXIiOiAwfQoKUkVOREVSRVJfSlMgPSAiIiIKKGZ1bmN0aW9uICgpIHsKICBkb2N1bWVudC5ib2R5LmlubmVySFRNTCA9ICcnOwogIGZvciAodmFyIGkgPSAwOyBpIDwgX19OVU1fTEFORVNfXzsgaSsrKSB7CiAgICB2YXIgZGl2ID0gZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgnZGl2Jyk7CiAgICBkaXYuaWQgPSAna3V0dV8nICsgaTsKICAgIGRvY3VtZW50LmJvZHkuYXBwZW5kQ2hpbGQoZGl2KTsKICB9CiAgdmFyIHNjcmlwdCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ3NjcmlwdCcpOwogIHNjcmlwdC5zcmMgPSAnaHR0cHM6Ly9jaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9hcGkuanM/cmVuZGVyPWV4cGxpY2l0JzsKICBzY3JpcHQub25sb2FkID0gZnVuY3Rpb24gKCkgewogICAgZm9yICh2YXIgaSA9IDA7IGkgPCBfX05VTV9MQU5FU19fOyBpKyspIHsKICAgICAgKGZ1bmN0aW9uIChpZHgpIHsKICAgICAgICBzZXRUaW1lb3V0KGZ1bmN0aW9uICgpIHsKICAgICAgICAgIHZhciB3aWRnZXRJZCA9IHdpbmRvdy50dXJuc3RpbGUucmVuZGVyKCcja3V0dV8nICsgaWR4LCB7CiAgICAgICAgICAgIHNpdGVrZXk6ICdfX1NJVEVLRVlfXycsCiAgICAgICAgICAgIGNhbGxiYWNrOiBmdW5jdGlvbiAodG9rZW4pIHsKICAgICAgICAgICAgICBjb25zb2xlLmxvZygnVDonICsgdG9rZW4pOwogICAgICAgICAgICAgIHdpbmRvdy50dXJuc3RpbGUucmVzZXQod2lkZ2V0SWQpOwogICAgICAgICAgICB9LAogICAgICAgICAgICAnZXJyb3ItY2FsbGJhY2snOiBmdW5jdGlvbiAoKSB7IHdpbmRvdy50dXJuc3RpbGUucmVzZXQod2lkZ2V0SWQpOyB9CiAgICAgICAgICB9KTsKICAgICAgICB9LCBpZHggKiBfX0xBTkVfU1RBR0dFUl9NU19fKTsKICAgICAgfSkoaSk7CiAgICB9CiAgfTsKICBkb2N1bWVudC5oZWFkLmFwcGVuZENoaWxkKHNjcmlwdCk7Cn0pKCk7CiIiIgoKCmRlZiBfZmlsbChqcyk6CiAgICByZXR1cm4gKAogICAgICAgIGpzLnJlcGxhY2UoIl9fTlVNX0xBTkVTX18iLCBzdHIoTlVNX0xBTkVTKSkKICAgICAgICAgIC5yZXBsYWNlKCJfX0xBTkVfU1RBR0dFUl9NU19fIiwgc3RyKExBTkVfU1RBR0dFUl9NUykpCiAgICAgICAgICAucmVwbGFjZSgiX19TSVRFS0VZX18iLCBTSVRFS0VZKQogICAgKQoKCmFzeW5jIGRlZiBpbmplY3RfcmVuZGVyZXIocGFnZSk6CiAgICAjIFVzZSBwYWdlLmFkZF9zY3JpcHRfdGFnIChhcHBlbmRzIGEgcmVhbCA8c2NyaXB0PiBlbGVtZW50IHRvIHRoZSBkb2N1bWVudCkKICAgICMgcmF0aGVyIHRoYW4gcGFnZS5ldmFsdWF0ZSwgc28gdGhlIHNjcmlwdCBydW5zIGluIHRoZSBwYWdlJ3MgbWFpbiB3b3JsZC4KICAgICMgQ2Ftb3Vmb3gncyBldmFsdWF0ZSBpc29sYXRpb24gbWFrZXMgdGhlIG1haW4gd29ybGQncyBgd2luZG93LnR1cm5zdGlsZWAKICAgICMgaW52aXNpYmxlIHRvIFB5dGhvbi1zaWRlIGNoZWNrcywgc28gd2UgbGV0IHRoZSBpbi1wYWdlIHNjcmlwdC5vbmxvYWQKICAgICMgaGFuZGxlciBkbyB0aGUgcmVuZGVyIG9uY2UgQ2xvdWRmbGFyZSdzIEFQSSBoYXMgbG9hZGVkLgogICAgYXdhaXQgcGFnZS5hZGRfc2NyaXB0X3RhZyhjb250ZW50PV9maWxsKFJFTkRFUkVSX0pTKSkKCgphc3luYyBkZWYgX3Bvc3RfdG9rZW4oc2Vzc2lvbiwgdG9rZW4pOgogICAgdHJ5OgogICAgICAgIGFzeW5jIHdpdGggc2Vzc2lvbi5wb3N0KE1PT05GSVZFX1VSTCwganNvbj17InRva2VuIjogdG9rZW59KSBhcyByZXNwOgogICAgICAgICAgICBhd2FpdCByZXNwLnJlYWQoKQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICBwYXNzCgoKYXN5bmMgZGVmIF9yb3V0ZV9oYW5kbGVyKHJvdXRlKToKICAgICMgQmxvY2sgZXZlcnkgcmVxdWVzdCB0aGF0IGlzbid0IHRoZSB0b3AtbGV2ZWwgZG9jdW1lbnQgbmF2aWdhdGlvbiBvciBhCiAgICAjIENsb3VkZmxhcmUgVHVybnN0aWxlIHJlc291cmNlLiBnYXJ0aWMuaW8ncyBDU1MvSlMvZm9udHMvaW1hZ2VzL2Fkcy90cmFja2luZwogICAgIyBhcmUgbm90IG5lZWRlZCAod2Ugd2lwZSB0aGUgYm9keSBhbnl3YXkpLCBhbmQgYmxvY2tpbmcgdGhlbSBpcyB0aGUgc2luZ2xlCiAgICAjIGJpZ2dlc3QgQ1BVL2JhbmR3aWR0aCB3aW4gb24gYSBjb25zdHJhaW5lZCBydW5uZXIuCiAgICByZXF1ZXN0ID0gcm91dGUucmVxdWVzdAogICAgaWYgcmVxdWVzdC5yZXNvdXJjZV90eXBlID09ICJkb2N1bWVudCI6CiAgICAgICAgYXdhaXQgcm91dGUuY29udGludWVfKCkKICAgICAgICByZXR1cm4KICAgIGlmICJjaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tIiBpbiByZXF1ZXN0LnVybDoKICAgICAgICBhd2FpdCByb3V0ZS5jb250aW51ZV8oKQogICAgICAgIHJldHVybgogICAgYXdhaXQgcm91dGUuYWJvcnQoKQoKCmFzeW5jIGRlZiBzZXR1cF90YWIocGFnZSwgdGFiX2lkLCBzZXNzaW9uKToKICAgIGxhc3RfdGltZSA9IFt0aW1lLm1vbm90b25pYygpXQoKICAgIGRlZiBvbl9jb25zb2xlKG1zZyk6CiAgICAgICAgdGV4dCA9IG1zZy50ZXh0CiAgICAgICAgaWYgdGV4dC5zdGFydHN3aXRoKCJUOiIpOgogICAgICAgICAgICBub3cgPSB0aW1lLm1vbm90b25pYygpCiAgICAgICAgICAgIGVsYXBzZWQgPSBub3cgLSBsYXN0X3RpbWVbMF0KICAgICAgICAgICAgbGFzdF90aW1lWzBdID0gbm93CiAgICAgICAgICAgIHRva2VuID0gdGV4dFsyOl0KICAgICAgICAgICAgbGV2ZWwgPSB0b2tlblswXSBpZiB0b2tlbiBhbmQgdG9rZW5bMToyXSA9PSAiLiIgZWxzZSAib3RoZXIiCiAgICAgICAgICAgIGlmIGxldmVsIGluIF9sZXZlbF9jb3VudHM6CiAgICAgICAgICAgICAgICBfbGV2ZWxfY291bnRzW2xldmVsXSArPSAxCiAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICBfbGV2ZWxfY291bnRzWyJvdGhlciJdICs9IDEKICAgICAgICAgICAgbWFya2VyID0gIlx4MWJbMzJtTDHinJNceDFiWzBtIiBpZiBsZXZlbCA9PSAiMSIgZWxzZSAiXHgxYlszM21MMFx4MWJbMG0iCiAgICAgICAgICAgIHNob3J0ID0gdG9rZW5bOjI0XSArICIuLi4iICsgdG9rZW5bLTEyOl0KICAgICAgICAgICAgdG90YWxzID0gZiJMMTp7X2xldmVsX2NvdW50c1snMSddfSBMMDp7X2xldmVsX2NvdW50c1snMCddfSIKICAgICAgICAgICAgcHJpbnQoZiJbdGFie3RhYl9pZH0ge21hcmtlcn1dIHtzaG9ydH0gfCBceDFiWzMxbXtlbGFwc2VkOi4xZn1zXHgxYlswbSB8IHt0b3RhbHN9IikKICAgICAgICAgICAgYXN5bmNpby5jcmVhdGVfdGFzayhfcG9zdF90b2tlbihzZXNzaW9uLCB0b2tlbikpCgogICAgcGFnZS5vbigiY29uc29sZSIsIG9uX2NvbnNvbGUpCiAgICAjIEluc3RhbGwgdGhlIHJvdXRlIGhhbmRsZXIgQkVGT1JFIGdvdG8gc28gdGhlIHZlcnkgZmlyc3QgcmVxdWVzdCBpcyBmaWx0ZXJlZC4KICAgIGF3YWl0IHBhZ2Uucm91dGUoIioqLyoiLCBfcm91dGVfaGFuZGxlcikKCiAgICAjIGdhcnRpYy5pbydzIGBsb2FkYCBldmVudCBpcyB1bnJlbGlhYmxlIHVuZGVyIGhlYXZ5IGNvbmN1cnJlbmN5IChpdCB0aW1lZAogICAgIyBvdXQgYXQgMzBzIGluIHRlc3RpbmcsIGxlYXZpbmcgZG9jdW1lbnQuYm9keSBudWxsKS4gYGRvbWNvbnRlbnRsb2FkZWRgIGlzCiAgICAjIHN1ZmZpY2llbnQg4oCUIHRoZSByZW5kZXJlciBvbmx5IG5lZWRzIGJvZHkgdG8gZXhpc3QuIFdpdGggcmVxdWVzdCBibG9ja2luZwogICAgIyBpbiBwbGFjZSB0aGVyZSBhcmUgbm8gdGhpcmQtcGFydHkgcmVxdWVzdHMgdG8gd2FpdCBvbiwgc28gd2Ugc2tpcCB0aGUKICAgICMgbmV0d29ya2lkbGUgc2V0dGxlIGVudGlyZWx5OyBhIHNob3J0IDAuNXMgc2xlZXAgaXMgZW5vdWdoIGZvciBwYXJzZS4KICAgIHRyeToKICAgICAgICBhd2FpdCBwYWdlLmdvdG8oVEFSR0VUX1VSTCwgd2FpdF91bnRpbD0iZG9tY29udGVudGxvYWRlZCIsIHRpbWVvdXQ9NjAwMDApCiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHBhc3MKICAgIGF3YWl0IGFzeW5jaW8uc2xlZXAoMC41KQogICAgIyBnYXJ0aWMuaW8gaGFzIGEgUmVwb3J0LU9ubHkgQ1NQIHRoYXQgc3VyZmFjZXMgYXMgYW4gYGFkZF9zY3JpcHRfdGFnYCBlcnJvcgogICAgIyBpbiBQbGF5d3JpZ2h0IHdoZW4gdGhlIHJlbmRlcmVyIGNyZWF0ZXMgdGhlIENsb3VkZmxhcmUgVHVybnN0aWxlIHNjcmlwdCB0YWcsCiAgICAjIGJ1dCB0aGUgc2NyaXB0IHN0aWxsIGV4ZWN1dGVzIChyZXBvcnQtb25seSBkb2Vzbid0IGVuZm9yY2UpLiBFcnJvcnMgYXJlCiAgICAjIHNpbGVudGx5IHN3YWxsb3dlZCBoZXJlIGZvciB0aGF0IHJlYXNvbi4KICAgIHRyeToKICAgICAgICBhd2FpdCBpbmplY3RfcmVuZGVyZXIocGFnZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcGFzcwoKICAgIGFzeW5jIGRlZiBhdXRvX2NsaWNrZXIoKToKICAgICAgICAjIFNsb3dlZCBmcm9tIDAuNXMgdG8gM3MuIE1hbmFnZWQgVHVybnN0aWxlIGF1dG8tY29tcGxldGVzIG1vc3QKICAgICAgICAjIGNoYWxsZW5nZXMgd2l0aG91dCBhbiBpbnRlcmFjdGl2ZSBjbGljazsgdGhlIGNsaWNrZXIgZXhpc3RzIG9ubHkKICAgICAgICAjIGFzIGEgZmFsbGJhY2sgZm9yIHRoZSByYXJlIGludGVyYWN0aXZlIGNoYWxsZW5nZS4gQXQgMC41cyDDlyAzMAogICAgICAgICMgd2lkZ2V0cyBpdCB3YXMgYnVybmluZyB+MTIwIElQQyBjbGljayBhdHRlbXB0cy9zZWMgZm9yIGFsbW9zdCBubwogICAgICAgICMgdG9rZW5zLiAzcyBrZWVwcyB0aGUgc2FmZXR5IG5ldCBhdCAxLzYgdGhlIGNvc3QuCiAgICAgICAgd2hpbGUgbm90IHBhZ2UuaXNfY2xvc2VkKCk6CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGZvciBmcmFtZSBpbiBwYWdlLmZyYW1lczoKICAgICAgICAgICAgICAgICAgICBpZiAidHVybnN0aWxlIiBpbiBmcmFtZS51cmw6CiAgICAgICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGF3YWl0IGZyYW1lLmNsaWNrKCIjY2hhbGxlbmdlLXN0YWdlIikKICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHBhc3MKICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgYXdhaXQgZnJhbWUuY2xpY2soJ2lucHV0W3R5cGU9ImNoZWNrYm94Il0nKQogICAgICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDMuMCkKCiAgICBhc3luYyBkZWYgcmVsb2FkX2xvb3AoKToKICAgICAgICB3aGlsZSBub3QgcGFnZS5pc19jbG9zZWQoKToKICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcChSRUxPQURfSU5URVJWQUxfTVMgLyAxMDAwKQogICAgICAgICAgICBpZiBwYWdlLmlzX2Nsb3NlZCgpOgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGF3YWl0IHBhZ2UucmVsb2FkKHdhaXRfdW50aWw9ImRvbWNvbnRlbnRsb2FkZWQiLCB0aW1lb3V0PTYwMDAwKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBpZiBwYWdlLmlzX2Nsb3NlZCgpOgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGF3YWl0IGluamVjdF9yZW5kZXJlcihwYWdlKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwoKICAgIGFzeW5jaW8uY3JlYXRlX3Rhc2soYXV0b19jbGlja2VyKCkpCiAgICBhc3luY2lvLmNyZWF0ZV90YXNrKHJlbG9hZF9sb29wKCkpCgoKYXN5bmMgZGVmIHJ1bl9icm93c2VyKGJyb3dzZXJfbnVtLCBzZXNzaW9uKToKICAgIHdoaWxlIFRydWU6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBwcmludChmIlticm93c2VyIHticm93c2VyX251bX1dIGxhdW5jaGluZyBmcmVzaCBDYW1vdWZveC4uLiIpCiAgICAgICAgICAgIGFzeW5jIHdpdGggQXN5bmNDYW1vdWZveCgKICAgICAgICAgICAgICAgIGhlYWRsZXNzPVRydWUsCiAgICAgICAgICAgICAgICBkaXNhYmxlX2Nvb3A9VHJ1ZSwKICAgICAgICAgICAgICAgICMgaHVtYW5pemU9RmFsc2Ug4oCUIGh1bWFuaXplIHNwYXducyBjdXJzb3ItbW92ZW1lbnQgd29ya2VycyB0aGF0CiAgICAgICAgICAgICAgICAjIGNvc3QgQ1BVIGFuZCBkb24ndCBoZWxwIGluIHRoZSBoZWFkbGVzcyBUdXJuc3RpbGUgZmxvdyAod2UKICAgICAgICAgICAgICAgICMgY2xpY2sgdmlhIFBsYXl3cmlnaHQgZnJhbWUgQVBJcywgYW5kIFR1cm5zdGlsZSBkb2Vzbid0IHdhdGNoCiAgICAgICAgICAgICAgICAjIGN1cnNvciBwYXRocyBpbiBoZWFkbGVzcyBtb2RlKS4gUHVyZSBvdmVyaGVhZCBvbiBhIDQtdkNQVSBib3guCiAgICAgICAgICAgICAgICBodW1hbml6ZT1GYWxzZSwKICAgICAgICAgICAgICAgIG9zPSgid2luZG93cyIsICJtYWNvcyIsICJsaW51eCIpLAogICAgICAgICAgICAgICAgIyBDb2xsYXBzZSBGaXJlZm94J3MgcGVyLXNpdGUvcGVyLWNvbnRleHQgcHJvY2VzcyB0cmVlLiBEZWZhdWx0CiAgICAgICAgICAgICAgICAjIHByb2R1Y2VkIDEzIGNvbnRlbnQgcHJvY2Vzc2VzIGZvciA2IGNvbnRleHRzLCBwZWdnaW5nIGEgNCB2Q1BVCiAgICAgICAgICAgICAgICAjIHJ1bm5lciBhdCAxMDAlIGJlZm9yZSBhbnkgd2lkZ2V0IGdldHMgY3ljbGVzLiBwcm9jZXNzQ291bnQ9NAogICAgICAgICAgICAgICAgIyBjYXBzIEZpcmVmb3ggYXQgb25lIGNvbnRlbnQgcHJvY2VzcyBwZXIgdkNQVSDigJQgZW5vdWdoIEpTLWVuZ2luZQogICAgICAgICAgICAgICAgIyBwYXJhbGxlbGlzbSB0byBrZWVwIHdpZGdldHMgc29sdmluZyB3aXRob3V0IElQQyB0aHJhc2guIEdvaW5nCiAgICAgICAgICAgICAgICAjIHRvIDEgb3Zlci1zZXJpYWxpemVzICh2ZXJpZmllZCBsb2NhbGx5OiA2MiB0b2tlbnMgaW4gOTBzIHZzCiAgICAgICAgICAgICAgICAjIDM3NCB3aXRoIGRlZmF1bHQpLiBmaXNzaW9uLmF1dG9zdGFydD1mYWxzZSBzdG9wcyBjcm9zcy1vcmlnaW4KICAgICAgICAgICAgICAgICMgaWZyYW1lcyAoVHVybnN0aWxlIGlzIGNyb3NzLW9yaWdpbiBmcm9tIGdhcnRpYy5pbykgZnJvbQogICAgICAgICAgICAgICAgIyBzcGF3bmluZyB0aGVpciBvd24gcHJvY2Vzc2VzIG9uIHRvcCBvZiB0aGUgY2FwLgogICAgICAgICAgICAgICAgZmlyZWZveF91c2VyX3ByZWZzPXsKICAgICAgICAgICAgICAgICAgICAiZmlzc2lvbi5hdXRvc3RhcnQiOiBGYWxzZSwKICAgICAgICAgICAgICAgICAgICAiZG9tLmlwYy5wcm9jZXNzQ291bnQiOiA0LAogICAgICAgICAgICAgICAgICAgICJkb20uaXBjLnByb2Nlc3NDb3VudC53ZWJJc29sYXRlZCI6IDQsCiAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICApIGFzIGJyb3dzZXI6CiAgICAgICAgICAgICAgICAjIEVhY2ggdGFiIGdldHMgaXRzIG93biBCcm93c2VyQ29udGV4dCDigJQgZnJlc2ggY29va2llcy9zdG9yYWdlLwogICAgICAgICAgICAgICAgIyBsb2NhbFN0b3JhZ2UvSW5kZXhlZERCIHBhcnRpdGlvbiwgZXF1aXZhbGVudCB0byBGaXJlZm94J3MKICAgICAgICAgICAgICAgICMgTXVsdGktQWNjb3VudCBDb250YWluZXJzLiBDbG91ZGZsYXJlIHNjb3JlcyBlYWNoIGNvbnRleHQgYXMgYQogICAgICAgICAgICAgICAgIyBkaXN0aW5jdCB1c2VyIHNoYXJpbmcgdGhlIElQLCB3aGljaCByYWlzZXMgdGhyb3VnaHB1dCB2cyBhbGwKICAgICAgICAgICAgICAgICMgdGFicyBzaGFyaW5nIG9uZSBjb29raWUgamFyLgogICAgICAgICAgICAgICAgIyBuZXdfY29udGV4dCgpL25ld19wYWdlKCkgbXVzdCBzdGlsbCBiZSBzZXJpYWxpemVkIOKAlCBjb25jdXJyZW50CiAgICAgICAgICAgICAgICAjIGNhbGxzIGhhbmcgaW4gQ2Ftb3Vmb3guIFN0YWdnZXIgc28gdGFicyBkb24ndCBoaXQgZ2FydGljLmlvCiAgICAgICAgICAgICAgICAjIHNpbXVsdGFuZW91c2x5LgogICAgICAgICAgICAgICAgZm9yIGkgaW4gcmFuZ2UoTlVNX1RBQlMpOgogICAgICAgICAgICAgICAgICAgIHRhYl9pZCA9IGYie2Jyb3dzZXJfbnVtfS57aSArIDF9IgogICAgICAgICAgICAgICAgICAgIGNvbnRleHQgPSBhd2FpdCBicm93c2VyLm5ld19jb250ZXh0KCkKICAgICAgICAgICAgICAgICAgICBwYWdlID0gYXdhaXQgY29udGV4dC5uZXdfcGFnZSgpCiAgICAgICAgICAgICAgICAgICAgYXN5bmNpby5jcmVhdGVfdGFzayhzZXR1cF90YWIocGFnZSwgdGFiX2lkLCBzZXNzaW9uKSkKICAgICAgICAgICAgICAgICAgICBpZiBpIDwgTlVNX1RBQlMgLSAxOgogICAgICAgICAgICAgICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDMpCiAgICAgICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKEJST1dTRVJfTElGRVRJTUVfTVMgLyAxMDAwKQogICAgICAgICAgICAgICAgcHJpbnQoZiJbYnJvd3NlciB7YnJvd3Nlcl9udW19XSBsaWZldGltZSByZWFjaGVkLCByZWN5Y2xpbmcuLi4iKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoZiJbYnJvd3NlciB7YnJvd3Nlcl9udW19XSBlcnJvcjoge2V9IikKCgphc3luYyBkZWYgbWFpbigpOgogICAgYXN5bmMgd2l0aCBhaW9odHRwLkNsaWVudFNlc3Npb24oKSBhcyBzZXNzaW9uOgogICAgICAgIHRhc2tzID0gW10KICAgICAgICBmb3IgYiBpbiByYW5nZShOVU1fQlJPV1NFUlMpOgogICAgICAgICAgICB0YXNrcy5hcHBlbmQoYXN5bmNpby5jcmVhdGVfdGFzayhydW5fYnJvd3NlcihiICsgMSwgc2Vzc2lvbikpKQogICAgICAgICAgICAjIFN0YWdnZXIgYnJvd3NlciBsYXVuY2hlcyBzbyB0aGV5IGRvbid0IGFsbCByZWN5Y2xlIGluIGxvY2tzdGVwCiAgICAgICAgICAgIGlmIGIgPCBOVU1fQlJPV1NFUlMgLSAxOgogICAgICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcCgoQlJPV1NFUl9MSUZFVElNRV9NUyAvIE5VTV9CUk9XU0VSUykgLyAxMDAwKQogICAgICAgIGF3YWl0IGFzeW5jaW8uZ2F0aGVyKCp0YXNrcywgcmV0dXJuX2V4Y2VwdGlvbnM9VHJ1ZSkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgYXN5bmNpby5ydW4obWFpbigpKQo='
-          echo "$GEN_B64" | base64 -d > /opt/camoufox/generator.py
-          wc -c /opt/camoufox/generator.py
-          head -1 /opt/camoufox/generator.py
+          # generator.py is embedded as base64 to avoid YAML/PowerShell heredoc
+          # escaping issues. This is the EXACT working version (2 browsers x 3 tabs
+          # x 5 lanes = 30 widgets, sequential new_page, domcontentloaded goto).
+          $generatorB64 = "aW1wb3J0IGFzeW5jaW8KaW1wb3J0IHRpbWUKaW1wb3J0IGFpb2h0dHAKZnJvbSBjYW1vdWZveC5hc3luY19hcGkgaW1wb3J0IEFzeW5jQ2Ftb3Vmb3gKCiMgQ2Ftb3Vmb3ggcG9ydCBvZiBAbWFnaWp1ZGFyJ3MgcHVwcGV0ZWVyIHBhdHRlcm4gKHNoaXBzIGV2ZXJ5IHRva2VuIHRvIG1vb25maXZlKQoKTU9PTkZJVkVfVVJMICAgICAgICAgID0gImh0dHBzOi8vbW9vbmZpdmUuYWx3YXlzZGF0YS5uZXQvYWRkLXRva2VuIgpUQVJHRVRfVVJMICAgICAgICAgICAgPSAiaHR0cHM6Ly9nYXJ0aWMuaW8iClNJVEVLRVkgICAgICAgICAgICAgICA9ICIweDRBQUFBQUFCQlBLYUliTnduUEVmU28iCk5VTV9CUk9XU0VSUyAgICAgICAgICA9IDEgICAgICAgICAgICAgICAgICAgICAgICMgc2luZ2xlIENhbW91Zm94IHByb2Nlc3Mg4oCUIGhhbGYgdGhlIE9TIG92ZXJoZWFkIHZzIDIKTlVNX1RBQlMgICAgICAgICAgICAgID0gNiAgICAgICAgICAgICAgICAgICAgICAgIyB0YWJzIHBlciBicm93c2VyIChlYWNoIGdldHMgaXRzIG93biBCcm93c2VyQ29udGV4dCkKTlVNX0xBTkVTICAgICAgICAgICAgID0gNSAgICAgICAgICAgICAgICAgICAgICAgIyBwYXJhbGxlbCB0dXJuc3RpbGUgd2lkZ2V0cyBwZXIgdGFiCkxBTkVfU1RBR0dFUl9NUyAgICAgICA9IDUwMCAgICAgICAgICAgICAgICAgICAgICMgZGVsYXkgYmV0d2VlbiBzdGFydGluZyBlYWNoIGxhbmUgKGF2b2lkcyBidXJzdCkKUkVMT0FEX0lOVEVSVkFMX01TICAgID0gNjAgKiA2MF8wMDAgICAgICAgICAgICAgIyBlZmZlY3RpdmVseSBkaXNhYmxlZCDigJQgd2lkZ2V0cyByZXNldCgpIGluIHBsYWNlCkJST1dTRVJfTElGRVRJTUVfTVMgICA9IDUwICogNjBfMDAwICAgICAgICAgICAgICMgfjUwIG1pbiBsaWZldGltZTsgcmVsb2FkIHdvdWxkIG5ldmVyIGZpcmUgZmlyc3QKCiMgQ291bnRlcnMgZm9yIHRva2VuLXZlcnNpb24gZGlhZ25vc3RpY3MuIENsb3VkZmxhcmUncyBsZWFkaW5nICIwLiIvIjEuIiBwcmVmaXgKIyBpcyBpdHMgaW50ZXJuYWwgcm90YXRpb24vdmVyc2lvbiAoTk9UIGEgcmlzayBzY29yZSkg4oCUIGJvdGggcGFzcyBzaXRldmVyaWZ5LgojIFRoZSBpY2Vib3QgR28gc2VydmVyJ3Mgb2xkIGhhcmRjb2RlZCBgWzoyXSAhPSAiMS4iYCBmaWx0ZXIgYXQgdHVybnN0aWxlLmdvOjc5CiMgc2lsZW50bHkgcmVqZWN0ZWQgZXZlcnkgIjAuIiB0b2tlbiB1bnRpbCAyMDI2LTA1LTA0OyBsb2dnaW5nIGJvdGggbGV0cyB1cwojIHNwb3QgYSByZWdyZXNzaW9uIHRoZXJlIGltbWVkaWF0ZWx5LgpfbGV2ZWxfY291bnRzID0geyIwIjogMCwgIjEiOiAwLCAib3RoZXIiOiAwfQoKUkVOREVSRVJfSlMgPSAiIiIKKGZ1bmN0aW9uICgpIHsKICBkb2N1bWVudC5ib2R5LmlubmVySFRNTCA9ICcnOwogIGZvciAodmFyIGkgPSAwOyBpIDwgX19OVU1fTEFORVNfXzsgaSsrKSB7CiAgICB2YXIgZGl2ID0gZG9jdW1lbnQuY3JlYXRlRWxlbWVudCgnZGl2Jyk7CiAgICBkaXYuaWQgPSAna3V0dV8nICsgaTsKICAgIGRvY3VtZW50LmJvZHkuYXBwZW5kQ2hpbGQoZGl2KTsKICB9CiAgdmFyIHNjcmlwdCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ3NjcmlwdCcpOwogIHNjcmlwdC5zcmMgPSAnaHR0cHM6Ly9jaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9hcGkuanM/cmVuZGVyPWV4cGxpY2l0JzsKICBzY3JpcHQub25sb2FkID0gZnVuY3Rpb24gKCkgewogICAgZm9yICh2YXIgaSA9IDA7IGkgPCBfX05VTV9MQU5FU19fOyBpKyspIHsKICAgICAgKGZ1bmN0aW9uIChpZHgpIHsKICAgICAgICBzZXRUaW1lb3V0KGZ1bmN0aW9uICgpIHsKICAgICAgICAgIHZhciB3aWRnZXRJZCA9IHdpbmRvdy50dXJuc3RpbGUucmVuZGVyKCcja3V0dV8nICsgaWR4LCB7CiAgICAgICAgICAgIHNpdGVrZXk6ICdfX1NJVEVLRVlfXycsCiAgICAgICAgICAgIGNhbGxiYWNrOiBmdW5jdGlvbiAodG9rZW4pIHsKICAgICAgICAgICAgICBjb25zb2xlLmxvZygnVDonICsgdG9rZW4pOwogICAgICAgICAgICAgIHdpbmRvdy50dXJuc3RpbGUucmVzZXQod2lkZ2V0SWQpOwogICAgICAgICAgICB9LAogICAgICAgICAgICAnZXJyb3ItY2FsbGJhY2snOiBmdW5jdGlvbiAoKSB7IHdpbmRvdy50dXJuc3RpbGUucmVzZXQod2lkZ2V0SWQpOyB9CiAgICAgICAgICB9KTsKICAgICAgICB9LCBpZHggKiBfX0xBTkVfU1RBR0dFUl9NU19fKTsKICAgICAgfSkoaSk7CiAgICB9CiAgfTsKICBkb2N1bWVudC5oZWFkLmFwcGVuZENoaWxkKHNjcmlwdCk7Cn0pKCk7CiIiIgoKCmRlZiBfZmlsbChqcyk6CiAgICByZXR1cm4gKAogICAgICAgIGpzLnJlcGxhY2UoIl9fTlVNX0xBTkVTX18iLCBzdHIoTlVNX0xBTkVTKSkKICAgICAgICAgIC5yZXBsYWNlKCJfX0xBTkVfU1RBR0dFUl9NU19fIiwgc3RyKExBTkVfU1RBR0dFUl9NUykpCiAgICAgICAgICAucmVwbGFjZSgiX19TSVRFS0VZX18iLCBTSVRFS0VZKQogICAgKQoKCmFzeW5jIGRlZiBpbmplY3RfcmVuZGVyZXIocGFnZSk6CiAgICAjIFVzZSBwYWdlLmFkZF9zY3JpcHRfdGFnIChhcHBlbmRzIGEgcmVhbCA8c2NyaXB0PiBlbGVtZW50IHRvIHRoZSBkb2N1bWVudCkKICAgICMgcmF0aGVyIHRoYW4gcGFnZS5ldmFsdWF0ZSwgc28gdGhlIHNjcmlwdCBydW5zIGluIHRoZSBwYWdlJ3MgbWFpbiB3b3JsZC4KICAgICMgQ2Ftb3Vmb3gncyBldmFsdWF0ZSBpc29sYXRpb24gbWFrZXMgdGhlIG1haW4gd29ybGQncyBgd2luZG93LnR1cm5zdGlsZWAKICAgICMgaW52aXNpYmxlIHRvIFB5dGhvbi1zaWRlIGNoZWNrcywgc28gd2UgbGV0IHRoZSBpbi1wYWdlIHNjcmlwdC5vbmxvYWQKICAgICMgaGFuZGxlciBkbyB0aGUgcmVuZGVyIG9uY2UgQ2xvdWRmbGFyZSdzIEFQSSBoYXMgbG9hZGVkLgogICAgYXdhaXQgcGFnZS5hZGRfc2NyaXB0X3RhZyhjb250ZW50PV9maWxsKFJFTkRFUkVSX0pTKSkKCgphc3luYyBkZWYgX3Bvc3RfdG9rZW4oc2Vzc2lvbiwgdG9rZW4pOgogICAgdHJ5OgogICAgICAgIGFzeW5jIHdpdGggc2Vzc2lvbi5wb3N0KE1PT05GSVZFX1VSTCwganNvbj17InRva2VuIjogdG9rZW59KSBhcyByZXNwOgogICAgICAgICAgICBhd2FpdCByZXNwLnJlYWQoKQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICBwYXNzCgoKYXN5bmMgZGVmIF9yb3V0ZV9oYW5kbGVyKHJvdXRlKToKICAgICMgQmxvY2sgZXZlcnkgcmVxdWVzdCB0aGF0IGlzbid0IHRoZSB0b3AtbGV2ZWwgZG9jdW1lbnQgbmF2aWdhdGlvbiBvciBhCiAgICAjIENsb3VkZmxhcmUgVHVybnN0aWxlIHJlc291cmNlLiBnYXJ0aWMuaW8ncyBDU1MvSlMvZm9udHMvaW1hZ2VzL2Fkcy90cmFja2luZwogICAgIyBhcmUgbm90IG5lZWRlZCAod2Ugd2lwZSB0aGUgYm9keSBhbnl3YXkpLCBhbmQgYmxvY2tpbmcgdGhlbSBpcyB0aGUgc2luZ2xlCiAgICAjIGJpZ2dlc3QgQ1BVL2JhbmR3aWR0aCB3aW4gb24gYSBjb25zdHJhaW5lZCBydW5uZXIuCiAgICByZXF1ZXN0ID0gcm91dGUucmVxdWVzdAogICAgaWYgcmVxdWVzdC5yZXNvdXJjZV90eXBlID09ICJkb2N1bWVudCI6CiAgICAgICAgYXdhaXQgcm91dGUuY29udGludWVfKCkKICAgICAgICByZXR1cm4KICAgIGlmICJjaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tIiBpbiByZXF1ZXN0LnVybDoKICAgICAgICBhd2FpdCByb3V0ZS5jb250aW51ZV8oKQogICAgICAgIHJldHVybgogICAgYXdhaXQgcm91dGUuYWJvcnQoKQoKCmFzeW5jIGRlZiBzZXR1cF90YWIocGFnZSwgdGFiX2lkLCBzZXNzaW9uKToKICAgIGxhc3RfdGltZSA9IFt0aW1lLm1vbm90b25pYygpXQoKICAgIGRlZiBvbl9jb25zb2xlKG1zZyk6CiAgICAgICAgdGV4dCA9IG1zZy50ZXh0CiAgICAgICAgaWYgdGV4dC5zdGFydHN3aXRoKCJUOiIpOgogICAgICAgICAgICBub3cgPSB0aW1lLm1vbm90b25pYygpCiAgICAgICAgICAgIGVsYXBzZWQgPSBub3cgLSBsYXN0X3RpbWVbMF0KICAgICAgICAgICAgbGFzdF90aW1lWzBdID0gbm93CiAgICAgICAgICAgIHRva2VuID0gdGV4dFsyOl0KICAgICAgICAgICAgbGV2ZWwgPSB0b2tlblswXSBpZiB0b2tlbiBhbmQgdG9rZW5bMToyXSA9PSAiLiIgZWxzZSAib3RoZXIiCiAgICAgICAgICAgIGlmIGxldmVsIGluIF9sZXZlbF9jb3VudHM6CiAgICAgICAgICAgICAgICBfbGV2ZWxfY291bnRzW2xldmVsXSArPSAxCiAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICBfbGV2ZWxfY291bnRzWyJvdGhlciJdICs9IDEKICAgICAgICAgICAgbWFya2VyID0gIlx4MWJbMzJtTDHinJNceDFiWzBtIiBpZiBsZXZlbCA9PSAiMSIgZWxzZSAiXHgxYlszM21MMFx4MWJbMG0iCiAgICAgICAgICAgIHNob3J0ID0gdG9rZW5bOjI0XSArICIuLi4iICsgdG9rZW5bLTEyOl0KICAgICAgICAgICAgdG90YWxzID0gZiJMMTp7X2xldmVsX2NvdW50c1snMSddfSBMMDp7X2xldmVsX2NvdW50c1snMCddfSIKICAgICAgICAgICAgcHJpbnQoZiJbdGFie3RhYl9pZH0ge21hcmtlcn1dIHtzaG9ydH0gfCBceDFiWzMxbXtlbGFwc2VkOi4xZn1zXHgxYlswbSB8IHt0b3RhbHN9IikKICAgICAgICAgICAgYXN5bmNpby5jcmVhdGVfdGFzayhfcG9zdF90b2tlbihzZXNzaW9uLCB0b2tlbikpCgogICAgcGFnZS5vbigiY29uc29sZSIsIG9uX2NvbnNvbGUpCiAgICAjIEluc3RhbGwgdGhlIHJvdXRlIGhhbmRsZXIgQkVGT1JFIGdvdG8gc28gdGhlIHZlcnkgZmlyc3QgcmVxdWVzdCBpcyBmaWx0ZXJlZC4KICAgIGF3YWl0IHBhZ2Uucm91dGUoIioqLyoiLCBfcm91dGVfaGFuZGxlcikKCiAgICAjIGdhcnRpYy5pbydzIGBsb2FkYCBldmVudCBpcyB1bnJlbGlhYmxlIHVuZGVyIGhlYXZ5IGNvbmN1cnJlbmN5IChpdCB0aW1lZAogICAgIyBvdXQgYXQgMzBzIGluIHRlc3RpbmcsIGxlYXZpbmcgZG9jdW1lbnQuYm9keSBudWxsKS4gYGRvbWNvbnRlbnRsb2FkZWRgIGlzCiAgICAjIHN1ZmZpY2llbnQg4oCUIHRoZSByZW5kZXJlciBvbmx5IG5lZWRzIGJvZHkgdG8gZXhpc3QuIFdpdGggcmVxdWVzdCBibG9ja2luZwogICAgIyBpbiBwbGFjZSB0aGVyZSBhcmUgbm8gdGhpcmQtcGFydHkgcmVxdWVzdHMgdG8gd2FpdCBvbiwgc28gd2Ugc2tpcCB0aGUKICAgICMgbmV0d29ya2lkbGUgc2V0dGxlIGVudGlyZWx5OyBhIHNob3J0IDAuNXMgc2xlZXAgaXMgZW5vdWdoIGZvciBwYXJzZS4KICAgIHRyeToKICAgICAgICBhd2FpdCBwYWdlLmdvdG8oVEFSR0VUX1VSTCwgd2FpdF91bnRpbD0iZG9tY29udGVudGxvYWRlZCIsIHRpbWVvdXQ9NjAwMDApCiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHBhc3MKICAgIGF3YWl0IGFzeW5jaW8uc2xlZXAoMC41KQogICAgIyBnYXJ0aWMuaW8gaGFzIGEgUmVwb3J0LU9ubHkgQ1NQIHRoYXQgc3VyZmFjZXMgYXMgYW4gYGFkZF9zY3JpcHRfdGFnYCBlcnJvcgogICAgIyBpbiBQbGF5d3JpZ2h0IHdoZW4gdGhlIHJlbmRlcmVyIGNyZWF0ZXMgdGhlIENsb3VkZmxhcmUgVHVybnN0aWxlIHNjcmlwdCB0YWcsCiAgICAjIGJ1dCB0aGUgc2NyaXB0IHN0aWxsIGV4ZWN1dGVzIChyZXBvcnQtb25seSBkb2Vzbid0IGVuZm9yY2UpLiBFcnJvcnMgYXJlCiAgICAjIHNpbGVudGx5IHN3YWxsb3dlZCBoZXJlIGZvciB0aGF0IHJlYXNvbi4KICAgIHRyeToKICAgICAgICBhd2FpdCBpbmplY3RfcmVuZGVyZXIocGFnZSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcGFzcwoKICAgIGFzeW5jIGRlZiBhdXRvX2NsaWNrZXIoKToKICAgICAgICAjIFNsb3dlZCBmcm9tIDAuNXMgdG8gM3MuIE1hbmFnZWQgVHVybnN0aWxlIGF1dG8tY29tcGxldGVzIG1vc3QKICAgICAgICAjIGNoYWxsZW5nZXMgd2l0aG91dCBhbiBpbnRlcmFjdGl2ZSBjbGljazsgdGhlIGNsaWNrZXIgZXhpc3RzIG9ubHkKICAgICAgICAjIGFzIGEgZmFsbGJhY2sgZm9yIHRoZSByYXJlIGludGVyYWN0aXZlIGNoYWxsZW5nZS4gQXQgMC41cyDDlyAzMAogICAgICAgICMgd2lkZ2V0cyBpdCB3YXMgYnVybmluZyB+MTIwIElQQyBjbGljayBhdHRlbXB0cy9zZWMgZm9yIGFsbW9zdCBubwogICAgICAgICMgdG9rZW5zLiAzcyBrZWVwcyB0aGUgc2FmZXR5IG5ldCBhdCAxLzYgdGhlIGNvc3QuCiAgICAgICAgd2hpbGUgbm90IHBhZ2UuaXNfY2xvc2VkKCk6CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGZvciBmcmFtZSBpbiBwYWdlLmZyYW1lczoKICAgICAgICAgICAgICAgICAgICBpZiAidHVybnN0aWxlIiBpbiBmcmFtZS51cmw6CiAgICAgICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGF3YWl0IGZyYW1lLmNsaWNrKCIjY2hhbGxlbmdlLXN0YWdlIikKICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgICAgICAgICAgICAgICAgIHBhc3MKICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICAgICAgYXdhaXQgZnJhbWUuY2xpY2soJ2lucHV0W3R5cGU9ImNoZWNrYm94Il0nKQogICAgICAgICAgICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDMuMCkKCiAgICBhc3luYyBkZWYgcmVsb2FkX2xvb3AoKToKICAgICAgICB3aGlsZSBub3QgcGFnZS5pc19jbG9zZWQoKToKICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcChSRUxPQURfSU5URVJWQUxfTVMgLyAxMDAwKQogICAgICAgICAgICBpZiBwYWdlLmlzX2Nsb3NlZCgpOgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGF3YWl0IHBhZ2UucmVsb2FkKHdhaXRfdW50aWw9ImRvbWNvbnRlbnRsb2FkZWQiLCB0aW1lb3V0PTYwMDAwKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwogICAgICAgICAgICBpZiBwYWdlLmlzX2Nsb3NlZCgpOgogICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGF3YWl0IGluamVjdF9yZW5kZXJlcihwYWdlKQogICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICAgICAgcGFzcwoKICAgIGFzeW5jaW8uY3JlYXRlX3Rhc2soYXV0b19jbGlja2VyKCkpCiAgICBhc3luY2lvLmNyZWF0ZV90YXNrKHJlbG9hZF9sb29wKCkpCgoKYXN5bmMgZGVmIHJ1bl9icm93c2VyKGJyb3dzZXJfbnVtLCBzZXNzaW9uKToKICAgIHdoaWxlIFRydWU6CiAgICAgICAgdHJ5OgogICAgICAgICAgICBwcmludChmIlticm93c2VyIHticm93c2VyX251bX1dIGxhdW5jaGluZyBmcmVzaCBDYW1vdWZveC4uLiIpCiAgICAgICAgICAgIGFzeW5jIHdpdGggQXN5bmNDYW1vdWZveCgKICAgICAgICAgICAgICAgIGhlYWRsZXNzPVRydWUsCiAgICAgICAgICAgICAgICBkaXNhYmxlX2Nvb3A9VHJ1ZSwKICAgICAgICAgICAgICAgICMgaHVtYW5pemU9RmFsc2Ug4oCUIGh1bWFuaXplIHNwYXducyBjdXJzb3ItbW92ZW1lbnQgd29ya2VycyB0aGF0CiAgICAgICAgICAgICAgICAjIGNvc3QgQ1BVIGFuZCBkb24ndCBoZWxwIGluIHRoZSBoZWFkbGVzcyBUdXJuc3RpbGUgZmxvdyAod2UKICAgICAgICAgICAgICAgICMgY2xpY2sgdmlhIFBsYXl3cmlnaHQgZnJhbWUgQVBJcywgYW5kIFR1cm5zdGlsZSBkb2Vzbid0IHdhdGNoCiAgICAgICAgICAgICAgICAjIGN1cnNvciBwYXRocyBpbiBoZWFkbGVzcyBtb2RlKS4gUHVyZSBvdmVyaGVhZCBvbiBhIDQtdkNQVSBib3guCiAgICAgICAgICAgICAgICBodW1hbml6ZT1GYWxzZSwKICAgICAgICAgICAgICAgIG9zPSgid2luZG93cyIsICJtYWNvcyIsICJsaW51eCIpLAogICAgICAgICAgICAgICAgIyBDb2xsYXBzZSBGaXJlZm94J3MgcGVyLXNpdGUvcGVyLWNvbnRleHQgcHJvY2VzcyB0cmVlLiBEZWZhdWx0CiAgICAgICAgICAgICAgICAjIHByb2R1Y2VkIDEzIGNvbnRlbnQgcHJvY2Vzc2VzIGZvciA2IGNvbnRleHRzLCBwZWdnaW5nIGEgNCB2Q1BVCiAgICAgICAgICAgICAgICAjIHJ1bm5lciBhdCAxMDAlIGJlZm9yZSBhbnkgd2lkZ2V0IGdldHMgY3ljbGVzLiBwcm9jZXNzQ291bnQ9NAogICAgICAgICAgICAgICAgIyBjYXBzIEZpcmVmb3ggYXQgb25lIGNvbnRlbnQgcHJvY2VzcyBwZXIgdkNQVSDigJQgZW5vdWdoIEpTLWVuZ2luZQogICAgICAgICAgICAgICAgIyBwYXJhbGxlbGlzbSB0byBrZWVwIHdpZGdldHMgc29sdmluZyB3aXRob3V0IElQQyB0aHJhc2guIEdvaW5nCiAgICAgICAgICAgICAgICAjIHRvIDEgb3Zlci1zZXJpYWxpemVzICh2ZXJpZmllZCBsb2NhbGx5OiA2MiB0b2tlbnMgaW4gOTBzIHZzCiAgICAgICAgICAgICAgICAjIDM3NCB3aXRoIGRlZmF1bHQpLiBmaXNzaW9uLmF1dG9zdGFydD1mYWxzZSBzdG9wcyBjcm9zcy1vcmlnaW4KICAgICAgICAgICAgICAgICMgaWZyYW1lcyAoVHVybnN0aWxlIGlzIGNyb3NzLW9yaWdpbiBmcm9tIGdhcnRpYy5pbykgZnJvbQogICAgICAgICAgICAgICAgIyBzcGF3bmluZyB0aGVpciBvd24gcHJvY2Vzc2VzIG9uIHRvcCBvZiB0aGUgY2FwLgogICAgICAgICAgICAgICAgZmlyZWZveF91c2VyX3ByZWZzPXsKICAgICAgICAgICAgICAgICAgICAiZmlzc2lvbi5hdXRvc3RhcnQiOiBGYWxzZSwKICAgICAgICAgICAgICAgICAgICAiZG9tLmlwYy5wcm9jZXNzQ291bnQiOiA0LAogICAgICAgICAgICAgICAgICAgICJkb20uaXBjLnByb2Nlc3NDb3VudC53ZWJJc29sYXRlZCI6IDQsCiAgICAgICAgICAgICAgICB9LAogICAgICAgICAgICApIGFzIGJyb3dzZXI6CiAgICAgICAgICAgICAgICAjIEVhY2ggdGFiIGdldHMgaXRzIG93biBCcm93c2VyQ29udGV4dCDigJQgZnJlc2ggY29va2llcy9zdG9yYWdlLwogICAgICAgICAgICAgICAgIyBsb2NhbFN0b3JhZ2UvSW5kZXhlZERCIHBhcnRpdGlvbiwgZXF1aXZhbGVudCB0byBGaXJlZm94J3MKICAgICAgICAgICAgICAgICMgTXVsdGktQWNjb3VudCBDb250YWluZXJzLiBDbG91ZGZsYXJlIHNjb3JlcyBlYWNoIGNvbnRleHQgYXMgYQogICAgICAgICAgICAgICAgIyBkaXN0aW5jdCB1c2VyIHNoYXJpbmcgdGhlIElQLCB3aGljaCByYWlzZXMgdGhyb3VnaHB1dCB2cyBhbGwKICAgICAgICAgICAgICAgICMgdGFicyBzaGFyaW5nIG9uZSBjb29raWUgamFyLgogICAgICAgICAgICAgICAgIyBuZXdfY29udGV4dCgpL25ld19wYWdlKCkgbXVzdCBzdGlsbCBiZSBzZXJpYWxpemVkIOKAlCBjb25jdXJyZW50CiAgICAgICAgICAgICAgICAjIGNhbGxzIGhhbmcgaW4gQ2Ftb3Vmb3guIFN0YWdnZXIgc28gdGFicyBkb24ndCBoaXQgZ2FydGljLmlvCiAgICAgICAgICAgICAgICAjIHNpbXVsdGFuZW91c2x5LgogICAgICAgICAgICAgICAgZm9yIGkgaW4gcmFuZ2UoTlVNX1RBQlMpOgogICAgICAgICAgICAgICAgICAgIHRhYl9pZCA9IGYie2Jyb3dzZXJfbnVtfS57aSArIDF9IgogICAgICAgICAgICAgICAgICAgIGNvbnRleHQgPSBhd2FpdCBicm93c2VyLm5ld19jb250ZXh0KCkKICAgICAgICAgICAgICAgICAgICBwYWdlID0gYXdhaXQgY29udGV4dC5uZXdfcGFnZSgpCiAgICAgICAgICAgICAgICAgICAgYXN5bmNpby5jcmVhdGVfdGFzayhzZXR1cF90YWIocGFnZSwgdGFiX2lkLCBzZXNzaW9uKSkKICAgICAgICAgICAgICAgICAgICBpZiBpIDwgTlVNX1RBQlMgLSAxOgogICAgICAgICAgICAgICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKDMpCiAgICAgICAgICAgICAgICBhd2FpdCBhc3luY2lvLnNsZWVwKEJST1dTRVJfTElGRVRJTUVfTVMgLyAxMDAwKQogICAgICAgICAgICAgICAgcHJpbnQoZiJbYnJvd3NlciB7YnJvd3Nlcl9udW19XSBsaWZldGltZSByZWFjaGVkLCByZWN5Y2xpbmcuLi4iKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgcHJpbnQoZiJbYnJvd3NlciB7YnJvd3Nlcl9udW19XSBlcnJvcjoge2V9IikKCgphc3luYyBkZWYgbWFpbigpOgogICAgYXN5bmMgd2l0aCBhaW9odHRwLkNsaWVudFNlc3Npb24oKSBhcyBzZXNzaW9uOgogICAgICAgIHRhc2tzID0gW10KICAgICAgICBmb3IgYiBpbiByYW5nZShOVU1fQlJPV1NFUlMpOgogICAgICAgICAgICB0YXNrcy5hcHBlbmQoYXN5bmNpby5jcmVhdGVfdGFzayhydW5fYnJvd3NlcihiICsgMSwgc2Vzc2lvbikpKQogICAgICAgICAgICAjIFN0YWdnZXIgYnJvd3NlciBsYXVuY2hlcyBzbyB0aGV5IGRvbid0IGFsbCByZWN5Y2xlIGluIGxvY2tzdGVwCiAgICAgICAgICAgIGlmIGIgPCBOVU1fQlJPV1NFUlMgLSAxOgogICAgICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcCgoQlJPV1NFUl9MSUZFVElNRV9NUyAvIE5VTV9CUk9XU0VSUykgLyAxMDAwKQogICAgICAgIGF3YWl0IGFzeW5jaW8uZ2F0aGVyKCp0YXNrcywgcmV0dXJuX2V4Y2VwdGlvbnM9VHJ1ZSkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgYXN5bmNpby5ydW4obWFpbigpKQo="
+          [System.IO.File]::WriteAllBytes("$proj\generator.py", [Convert]::FromBase64String($generatorB64))
 
-      - name: 3. Install Python deps + fetch Camoufox Firefox (Linux build)
-        working-directory: /opt/camoufox
+          Write-Host "Project files dropped at $proj"
+
+      - name: 3. Install Python deps + fetch Camoufox Firefox
+        working-directory: C:\camoufox
         run: |
-          # Camoufox/Firefox runtime libs. Most ship preinstalled on
-          # ubuntu-24.04 but apt-get is a no-op for already-present packages.
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-              libgtk-3-0 libxt6 libdbus-glib-1-2 libpci3 \
-              libxss1 libnss3 libasound2t64 \
-              fonts-liberation
-
-          python3 -m venv venv
-          ./venv/bin/python -m pip install --upgrade pip
-          ./venv/bin/python -m pip install camoufox aiohttp
-          # ~150 MB patched Firefox; runner bandwidth makes this fast.
-          ./venv/bin/python -m camoufox fetch
+          python -m venv venv
+          .\venv\Scripts\python.exe -m pip install --upgrade pip
+          .\venv\Scripts\python.exe -m pip install camoufox aiohttp
+          # ~150 MB patched Firefox binary; runner bandwidth makes this fast.
+          .\venv\Scripts\python.exe -m camoufox fetch
 
       - name: 4. Run generator (this step is the keep-alive)
-        working-directory: /opt/camoufox
+        working-directory: C:\camoufox
         run: |
-          # Bump our shell to nice=-20 + realtime IO so Python inherits both.
-          # Nice can't go negative without CAP_SYS_NICE; renice via sudo grants
-          # it. After sudo exits, our shell keeps the new niceness, and the
-          # python child inherits.
-          sudo renice -n -20 -p $$ >/dev/null
-          sudo ionice -c 1 -n 0 -p $$ >/dev/null 2>&1 || true
-
-          # Stdout/err inherit so token logs stream live to the workflow.
-          ./venv/bin/python generator.py
+          # Start at HIGH priority. Direct invocation would inherit Normal;
+          # Start-Process -PassThru lets us bump the class before WaitForExit.
+          # Stdout/err are inherited so token logs stream live to the workflow.
+          $p = Start-Process -FilePath ".\venv\Scripts\python.exe" `
+                             -ArgumentList "generator.py" `
+                             -PassThru -NoNewWindow
+          $p.PriorityClass = "High"
+          $p.WaitForExit()
+          exit $p.ExitCode
