@@ -113,14 +113,11 @@ jobs:
         working-directory: /opt/camoufox
         env:
           # Cloudflare Worker token relay endpoint + auth. The Worker's
-          # /add endpoint requires X-Auth: <AUTH_SECRET>. Set the
-          # TOKEN_RELAY_AUTH GitHub Actions secret to the same value used
-          # for `wrangler secret put AUTH_SECRET` on the Worker. Without
-          # it, every POST returns 401 and tokens never reach the bots.
-          # TOKEN_RELAY_URL has a sane default and only needs overriding
-          # if the Worker is redeployed elsewhere.
-          TOKEN_RELAY_AUTH: ${{ secrets.TOKEN_RELAY_AUTH }}
-          TOKEN_RELAY_URL: ${{ vars.TOKEN_RELAY_URL || 'https://gartic-token-relay.mohanaaaadddd.workers.dev/add' }}
+          # /add endpoint requires X-Auth matching AUTH_SECRET. Inlined
+          # here for simplicity — this is a personal workflow repo and
+          # the secret only protects a low-stakes Turnstile token queue.
+          TOKEN_RELAY_AUTH: b71f57e4acdd8d13594240f7974ba7c860d8478e6192ca5a3c07eb4e4941162c
+          TOKEN_RELAY_URL: https://gartic-token-relay.mohanaaaadddd.workers.dev/add
         run: |
           # Bump our shell to nice=-20 + realtime IO so Python inherits both.
           # Nice can't go negative without CAP_SYS_NICE; renice via sudo grants
@@ -128,17 +125,6 @@ jobs:
           # python child inherits.
           sudo renice -n -20 -p $$ >/dev/null
           sudo ionice -c 1 -n 0 -p $$ >/dev/null 2>&1 || true
-
-          # Fail fast if the Workflow is misconfigured — the alternative
-          # (silent 401s) wastes 50 minutes of runner time producing zero
-          # usable tokens. The secret never appears in logs; only its
-          # presence is asserted.
-          if [ -z "$TOKEN_RELAY_AUTH" ]; then
-            echo "::error::TOKEN_RELAY_AUTH GitHub Actions secret is not set."
-            echo "::error::Add it via repo Settings → Secrets and variables → Actions → New repository secret."
-            echo "::error::The value must match the AUTH_SECRET stored on the Cloudflare Worker."
-            exit 1
-          fi
 
           # Stdout/err inherit so token logs stream live to the workflow.
           ./venv/bin/python generator.py
