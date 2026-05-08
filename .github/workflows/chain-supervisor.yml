@@ -31,6 +31,7 @@ jobs:
       - name: Count in-flight producers and refill the deficit
         env:
           GH_TOKEN: ${{ secrets.CHAIN_PAT }}
+          GH_REPO: ${{ github.repository }}   # tells gh which repo without a checkout
           PRODUCER: gartic-camoufox-linux.yml
           TARGET: 20
         run: |
