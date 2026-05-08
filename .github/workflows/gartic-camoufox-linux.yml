@@ -134,6 +134,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.CHAIN_PAT }}
+          GH_REPO: ${{ github.repository }}   # tells gh which repo without a checkout
         run: |
           for attempt in 1 2 3 4 5; do
             if gh workflow run gartic-camoufox-linux.yml; then
