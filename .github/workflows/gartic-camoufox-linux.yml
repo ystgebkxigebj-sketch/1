@@ -105,21 +105,20 @@ jobs:
 
           python3 -m venv venv
           ./venv/bin/python -m pip install --upgrade pip
-          # Pin BOTH camoufox and playwright to the last known-good combo.
-          # Unpinned, `pip install camoufox` pulls the newest playwright, which
-          # since 1.60.0 crashes the Firefox driver on the first page error with:
-          #   TypeError: Cannot read properties of undefined (reading 'url')
-          #   at FFPage._onUncaughtError (.../coreBundle.js)
-          # killing the driver's Node process (then a flood of "pipe closed by
-          # peer" as Python writes to the dead pipe) → zero tokens. Cause:
-          # Microsoft playwright PR #39767 dropped pageError.location; tracked as
-          # camoufox issue #617. playwright<1.60.0 resolves to 1.59.0, the last
-          # release before that change. camoufox==0.4.11 freezes the Firefox
-          # 135.0.1-beta.24 build the generator was validated against. NOTE:
-          # camoufox uses its OWN fetched Firefox (below), NOT playwright's
-          # bundled browser, so the client only needs Juggler-protocol
-          # compatibility — which 1.59.0 has with this build.
-          ./venv/bin/python -m pip install "camoufox==0.4.11" aiohttp "playwright<1.60.0"
+          # Pin camoufox AND playwright to the matched, known-good combo.
+          # camoufox==0.4.11 fetches its OWN patched Firefox 135.0.1-beta.24
+          # (below) and drives it over Playwright's "Juggler" protocol. Playwright
+          # bundles an exact Firefox build per release and its Juggler tracks that
+          # build, so the playwright client MUST match camoufox's Firefox 135 or
+          # the launch handshake mismatches. Firefox 135 ships in Playwright 1.51
+          # (1.50→FF134, 1.51→FF135, 1.52→FF137), and camoufox v135.0.1-beta.24
+          # explicitly "Add support for Playwright 1.51.0".
+          # History of this line: unpinned pulled the newest playwright; 1.60.0
+          # CRASHES on the first page error (TypeError reading 'url',
+          # FFPage._onUncaughtError — playwright PR #39767 / camoufox #617), while
+          # 1.59 (FF143 Juggler, ~8 majors ahead of FF135) HANGS at launch
+          # instead. 1.51.x is the only correct pin.
+          ./venv/bin/python -m pip install "camoufox==0.4.11" aiohttp "playwright>=1.51.0,<1.52.0"
           # ~150 MB patched Firefox; runner bandwidth makes this fast.
           ./venv/bin/python -m camoufox fetch
 
