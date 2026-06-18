@@ -1,6 +1,11 @@
 name: Gartic (Camoufox, headless, Linux experiment)
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "GitHub runner label (test different IP pools)"
+        required: false
+        default: "ubuntu-24.04"
 
 jobs:
   gartic-bot:
@@ -9,7 +14,7 @@ jobs:
     # picks up immediately. Bonus: Linux Camoufox runs slightly hotter than
     # Windows (no Defender, no Update Orchestrator, no DWM compositing) and
     # ubuntu-* minutes are billed at 1x vs Windows' 2x.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event.inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 358          # 2-min headroom under the 360 cap so the
                                   # successor-dispatch step always gets a slot.
 
