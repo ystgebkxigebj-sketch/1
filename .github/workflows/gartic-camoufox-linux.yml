@@ -106,8 +106,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
               libgtk-3-0 libxt6 libdbus-glib-1-2 libpci3 \
-              libxss1 libnss3 libasound2t64 \
+              libxss1 libnss3 \
               fonts-liberation
+          # libasound2 was renamed libasound2t64 in Ubuntu 24.04 (the time_t
+          # transition). 22.04 / older ARM images still use libasound2, so try
+          # the new name then fall back — otherwise apt aborts the whole step
+          # under `bash -e` and we never reach the generator.
+          sudo apt-get install -y --no-install-recommends libasound2t64 \
+              || sudo apt-get install -y --no-install-recommends libasound2 || true
 
           python3 -m venv venv
           ./venv/bin/python -m pip install --upgrade pip
