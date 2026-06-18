@@ -136,4 +136,10 @@ jobs:
           sudo ionice -c 1 -n 0 -p $$ >/dev/null 2>&1 || true
 
           # Stdout/err inherit so token logs stream live to the workflow.
-          ./venv/bin/python generator.py
+          # -u + PYTHONUNBUFFERED: Python block-buffers stdout when it's a pipe
+          # (the Actions log is not a TTY), so every print() — browser-launch
+          # lines, token lines, and the run_browser crash handler's
+          # "[browser N] error: ..." — would otherwise sit in an unflushed
+          # buffer and vanish if the process is killed, making a crash-loop look
+          # like a silent hang. Force unbuffered so diagnostics stream live.
+          PYTHONUNBUFFERED=1 ./venv/bin/python -u generator.py
