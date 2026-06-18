@@ -10,8 +10,7 @@ jobs:
     # Windows (no Defender, no Update Orchestrator, no DWM compositing) and
     # ubuntu-* minutes are billed at 1x vs Windows' 2x.
     runs-on: ubuntu-24.04
-    timeout-minutes: 358          # 2-min headroom under the 360 cap so the
-                                  # successor-dispatch step always gets a slot.
+    timeout-minutes: 360
 
     steps:
       - name: 1. Aggressive system tuning (services, CPU, network, FS)
@@ -106,14 +105,26 @@ jobs:
 
           python3 -m venv venv
           ./venv/bin/python -m pip install --upgrade pip
-          ./venv/bin/python -m pip install camoufox aiohttp
+          # Pin BOTH camoufox and playwright to the last known-good combo.
+          # Unpinned, `pip install camoufox` pulls the newest playwright, which
+          # since 1.60.0 crashes the Firefox driver on the first page error with:
+          #   TypeError: Cannot read properties of undefined (reading 'url')
+          #   at FFPage._onUncaughtError (.../coreBundle.js)
+          # killing the driver's Node process (then a flood of "pipe closed by
+          # peer" as Python writes to the dead pipe) → zero tokens. Cause:
+          # Microsoft playwright PR #39767 dropped pageError.location; tracked as
+          # camoufox issue #617. playwright<1.60.0 resolves to 1.59.0, the last
+          # release before that change. camoufox==0.4.11 freezes the Firefox
+          # 135.0.1-beta.24 build the generator was validated against. NOTE:
+          # camoufox uses its OWN fetched Firefox (below), NOT playwright's
+          # bundled browser, so the client only needs Juggler-protocol
+          # compatibility — which 1.59.0 has with this build.
+          ./venv/bin/python -m pip install "camoufox==0.4.11" aiohttp "playwright<1.60.0"
           # ~150 MB patched Firefox; runner bandwidth makes this fast.
           ./venv/bin/python -m camoufox fetch
 
       - name: 4. Run generator (this step is the keep-alive)
         working-directory: /opt/camoufox
-        timeout-minutes: 350      # bounded so step 5 has time to dispatch
-        continue-on-error: true   # never let a generator crash skip the handoff
         env:
           AUTH_SECRET: '74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434'   # 32-hex secret from turnstile-system\token-relay\.dev.vars
         run: |
@@ -126,22 +137,3 @@ jobs:
 
           # Stdout/err inherit so token logs stream live to the workflow.
           ./venv/bin/python generator.py
-
-      - name: 5. Dispatch successor (chain handoff)
-        # `if: always()` runs even when step 4 timed out, errored, or was
-        # canceled — the only way this step is skipped is a runner kill.
-        # The supervisor watchdog catches that case within 5 minutes.
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.CHAIN_PAT }}
-          GH_REPO: ${{ github.repository }}   # tells gh which repo without a checkout
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if gh workflow run gartic-camoufox-linux.yml; then
-              echo "Successor dispatched on attempt $attempt"
-              exit 0
-            fi
-            sleep $((attempt * 5))
-          done
-          echo "All dispatch attempts failed; supervisor will recover this slot"
-          exit 1
