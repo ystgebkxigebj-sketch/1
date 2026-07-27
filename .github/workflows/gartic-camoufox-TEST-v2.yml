@@ -1,0 +1,97 @@
+name: Gartic Camoufox TEST (v2 method, single worker)
+
+# A DIAGNOSTIC worker, not a producer. It answers one question:
+#   does Camoufox mint gartic Turnstile tokens from a GitHub runner IP?
+#
+# On the Oracle VM it does not: window.turnstile appears, the widget fires
+# `before-interactive`, and Cloudflare then renders NO iframe at all — so there
+# is nothing to solve or click. On the user's real Chrome (residential IP) the
+# same sitekey mints a 645-char token immediately. An automated Chromium on that
+# SAME residential IP fails too, which points at automation detection rather
+# than IP reputation — but that browser advertises a "Claude/1." user-agent, so
+# it is not a clean verdict on Camoufox. This workflow settles it on a clean
+# GitHub IP with the stealth browser.
+#
+# Deliberately NOT part of the producer chain: no successor dispatch, bounded
+# runtime, one runner. Read the log, then delete or keep as needed.
+#
+# RATE: unthrottled (--rate 0). The 12 tok/min cap that the browser producer
+# needs is a PER-IP limit — past it, Cloudflare keeps issuing tokens but
+# gartic's siteverify refuses them. A GitHub runner is a fresh IP each job, so
+# that ceiling does not apply here and throttling would only hide the answer.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to run the probe"
+        required: false
+        default: "10"
+      lanes:
+        description: "Parallel Turnstile widgets"
+        required: false
+        default: "5"
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: 1. System deps for Camoufox/Firefox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends               libgtk-3-0 libxt6 libdbus-glib-1-2 libpci3 libxss1 libnss3 fonts-liberation
+          sudo apt-get install -y --no-install-recommends libasound2t64               || sudo apt-get install -y --no-install-recommends libasound2 || true
+
+      - name: 2. Drop generator_v2 at /opt/camoufox
+        env:
+          GEN_B64: 'IiIiQ2Ftb3Vmb3ggVHVybnN0aWxlIGdlbmVyYXRvciDigJQgdjIsIHJlYnVpbHQgYXJvdW5kIHdoYXQgdGhlIDIwMjYtMDctMjcgb3V0YWdlIHRhdWdodC4KCldIQVQgQ0hBTkdFRCB2cyB0aGUgZ2VuZXJhdG9yIGN1cnJlbnRseSBlbWJlZGRlZCBpbiB0aGUgR2l0SHViIHdvcmtmbG93Ci0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tCjEuICoqVGhlIHRva2VuIGlzIHJlYWQgd2l0aCBgdHVybnN0aWxlLmdldFJlc3BvbnNlKHdpZGdldElkKWAsIG5vdCBmcm9tIHRoZQogICBjYWxsYmFjayBhcmd1bWVudC4qKiBUaGlzIGlzIHRoZSBiaWcgb25lLiBNZWFzdXJlZCBpbiBhIHJlYWwgYnJvd3NlciBvbgogICAyMDI2LTA3LTI3OiB0aGUgY2FsbGJhY2sgZmlyZXMgd2l0aCBhbiBFTVBUWSBhcmd1bWVudCB3aGlsZSBnZXRSZXNwb25zZSgpCiAgIGhvbGRzIHRoZSByZWFsIDY0NS1jaGFyYWN0ZXIgdG9rZW4uIFRoZSBvbGQgZ2VuZXJhdG9yIGxvZ2dlZCB0b2tlbnMgb25seSBmcm9tCiAgIGBjYWxsYmFjayh0b2tlbilgIHZpYSBgY29uc29sZS5sb2coJ1Q6Jyt0b2tlbilgLCBzbyBpZiB0aGUgc2FtZSB0aGluZyBoYXBwZW5zCiAgIGhlYWRsZXNzIGl0IHdvdWxkIHJlcG9ydCBaRVJPIHRva2VucyB3aGlsZSBhY3R1YWxseSBtaW50aW5nIHRoZW0uIFRoaXMKICAgdmVyc2lvbiBwb2xscyBnZXRSZXNwb25zZSgpIGFuZCB0cmVhdHMgdGhlIGNhbGxiYWNrIGFzIGEgaGludCBvbmx5LgoKMi4gKipgYWN0aW9uOiAnam9pbidgIGlzIHByZXNlbnQuKiogVGhlIGdlbmVyYXRvciBsaXZlIG9uIEdpdEh1YiBkb2VzIE5PVCBoYXZlCiAgIGl0LiBnYXJ0aWMgdmFsaWRhdGVzIHRoZSB0b2tlbidzIGFjdGlvbiBzZXJ2ZXItc2lkZSwgc28gZXZlcnkgdG9rZW4gdGhhdAogICBmbGVldCBtaW50cyBpcyByZWplY3RlZCBhdCBqb2luIHdpdGggY29kZSA1IHJlZ2FyZGxlc3Mgb2YgYW55dGhpbmcgZWxzZS4KCjMuICoqYGFwcGVhcmFuY2U6ICdpbnRlcmFjdGlvbi1vbmx5J2AqKiDigJQgY29waWVkIGZyb20gZ2FydGljJ3Mgb3duCiAgIGB0dXJuc3RpbGUucmVuZGVyYCBjYWxsLCBjYXB0dXJlZCBieSBob29raW5nIHJlbmRlciBvbiBhIGxpdmUgcm9vbSBwYWdlOgogICBge3NpdGVrZXk6JzB4NEFBQUFBQUJCUEthSWJOd25QRWZTbycsIGFjdGlvbjonam9pbicsCiAgICAgYXBwZWFyYW5jZTonaW50ZXJhY3Rpb24tb25seSd9YCwgbm8gY0RhdGEsIG5vIGV4ZWN1dGlvbi4KCjQuICoqV2lkZ2V0cyBhcmUgUkVDWUNMRUQsIG5vdCBgcmVzZXQoKWAuKiogcmVzZXQoKSBkb2VzIG5vdCByZWxpYWJseSByZS1hcm06CiAgIGVhY2ggd2lkZ2V0IHNvbHZlZCBleGFjdGx5IG9uY2UgdGhlbiB3ZW50IGlkbGUsIHNvIGEgcGFnZSBwcm9kdWNlZCBvbmUgdG9rZW4KICAgcGVyIHdpZGdldCBhbmQgc3RvcHBlZCBkZWFkLiBSZWN5Y2xpbmcgKHJlbW92ZSArIHJlbmRlciBmcmVzaCkgZ2l2ZXMgYSBuZXcKICAgY2hhbGxlbmdlIGNvbnRleHQuCgo1LiAqKkl0IGlzIGxvdWQuKiogVGhlIG9sZCBnZW5lcmF0b3Igd2FzIHNpbGVudCBhYm91dCAqd2h5KiBub3RoaW5nIGNhbWUgb3V0LgogICBUaGlzIG9uZSByZXBvcnRzLCBwZXIgY3ljbGU6IHdoZXRoZXIgYHdpbmRvdy50dXJuc3RpbGVgIGV2ZXIgYXBwZWFyZWQsIHdoaWNoCiAgIFR1cm5zdGlsZSBjYWxsYmFja3MgZmlyZWQgKG5vdGFibHkgYGJlZm9yZS1pbnRlcmFjdGl2ZWAsIHdoaWNoIG1lYW5zCiAgIENsb3VkZmxhcmUgd2FudHMgYSBjbGljayB0aGF0IHdpbGwgbmV2ZXIgY29tZSBoZWFkbGVzcyksIHdoZXRoZXIgYSBjaGFsbGVuZ2UKICAgaWZyYW1lIHdhcyBldmVyIGNyZWF0ZWQsIGFuZCB0aGUgZ2V0UmVzcG9uc2UoKSBvdXRjb21lLiBBIHJ1biB0aGF0IG1pbnRzCiAgIG5vdGhpbmcgc2hvdWxkIHN0aWxsIHRlbGwgeW91IGV4YWN0bHkgd2hlcmUgaXQgc3RvcHBlZC4KCktOT1dOIFJJU0sKLS0tLS0tLS0tLQpPbiB0aGUgT3JhY2xlIFZNIHRoaXMgYnJvd3NlciBnZXRzIGBCRUZPUkVfSU5URVJBQ1RJVkVgIGFuZCB0aGVuIENsb3VkZmxhcmUKY3JlYXRlcyAqKm5vIGlmcmFtZSBhdCBhbGwqKiwgc28gbm90aGluZyBjYW4gYmUgc29sdmVkIG9yIGNsaWNrZWQg4oCUIHRoZSBzYW1lCmhhcHBlbnMgZm9yIENhbW91Zm94IHYxMzUgYW5kIHYxNTIsIGhlYWRsZXNzLCB2aXJ0dWFsLWRpc3BsYXkgYW5kIGhlYWRmdWwuIFRoaXMKdmVyc2lvbiBkb2VzIG5vdCBmaXggdGhhdDsgaXQgb25seSByZW1vdmVzIGV2ZXJ5ICpvdGhlciogZXhwbGFuYXRpb24gc28gYQpHaXRIdWItcnVubmVyIHRlc3QgaXMgY29uY2x1c2l2ZSBlaXRoZXIgd2F5LgoiIiIKCmltcG9ydCBhcmdwYXJzZQppbXBvcnQgYXN5bmNpbwppbXBvcnQganNvbgppbXBvcnQgb3MKaW1wb3J0IHRpbWUKaW1wb3J0IHVybGxpYi5yZXF1ZXN0CmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAoKZnJvbSBjYW1vdWZveC5hc3luY19hcGkgaW1wb3J0IEFzeW5jQ2Ftb3Vmb3gKClNJVEVLRVkgPSAiMHg0QUFBQUFBQkJQS2FJYk53blBFZlNvIgpUQVJHRVRfVVJMID0gImh0dHBzOi8vZ2FydGljLmlvIgoKIyBBIH4yNTAtYnl0ZSBkb2N1bWVudCBzZXJ2ZWQgQVMgdGhlIGdhcnRpYy5pbyBvcmlnaW4uIFR1cm5zdGlsZSBjaGVja3MgdGhlCiMgb3JpZ2luIGFnYWluc3QgdGhlIHNpdGVrZXkncyBhbGxvd2VkIGRvbWFpbnMsIHNvIHRoZSBwYWdlIG11c3QgKnJlcG9ydCoKIyBnYXJ0aWMuaW87IGZldGNoaW5nIGdhcnRpYydzIHJlYWwgSFRNTCBjb3N0cyBiYW5kd2lkdGggYW5kIGJ1eXMgbm90aGluZy4KU1RVQl9IVE1MID0gIiIiPCFkb2N0eXBlIGh0bWw+PGh0bWw+PGhlYWQ+PG1ldGEgY2hhcnNldD0idXRmLTgiPjx0aXRsZT50PC90aXRsZT4KPHN0eWxlPmJvZHl7YmFja2dyb3VuZDojZmZmO2ZvbnQ6MTRweCBzYW5zLXNlcmlmO21hcmdpbjoyNHB4fS5ze3dpZHRoOjMyMHB4O2hlaWdodDo3MHB4O2Rpc3BsYXk6aW5saW5lLWJsb2NrfTwvc3R5bGU+CjwvaGVhZD48Ym9keT48aDM+dDwvaDM+PGRpdiBpZD0ibGFuZXMiPjwvZGl2Pgo8c2NyaXB0IHNyYz0iaHR0cHM6Ly9jaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tL3R1cm5zdGlsZS92MC9hcGkuanM/cmVuZGVyPWV4cGxpY2l0Ij48L3NjcmlwdD4KPC9ib2R5PjwvaHRtbD4iIiIKCiMgUmVuZGVyZWQgaW4tcGFnZS4gRWFjaCBsYW5lIGtlZXBzIGl0cyBvd24gd2lkZ2V0IGlkIHNvIHRoZSBQeXRob24gc2lkZSBjYW4KIyBwb2xsIGdldFJlc3BvbnNlKCkgcGVyIGxhbmUgYW5kIHJlY3ljbGUganVzdCB0aGF0IGxhbmUuCkJPT1RTVFJBUF9KUyA9ICIiIgooZnVuY3Rpb24gKCkgewogIHdpbmRvdy5fX2xhbmVzID0gW107CiAgd2luZG93Ll9fZGlhZyAgPSB7IHR1cm5zdGlsZVNlZW46IGZhbHNlLCBldmVudHM6IFtdIH07CiAgd2luZG93Ll9fbWtMYW5lID0gZnVuY3Rpb24gKGkpIHsKICAgIHZhciBob3N0ID0gZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoJ2xhbmVzJyk7CiAgICB2YXIgZCA9IGRvY3VtZW50LmNyZWF0ZUVsZW1lbnQoJ2RpdicpOwogICAgZC5jbGFzc05hbWUgPSAncyc7IGQuaWQgPSAnbGFuZV8nICsgaTsKICAgIGhvc3QuYXBwZW5kQ2hpbGQoZCk7CiAgICB2YXIgaWQgPSB3aW5kb3cudHVybnN0aWxlLnJlbmRlcignI2xhbmVfJyArIGksIHsKICAgICAgc2l0ZWtleTogJ19fU0lURUtFWV9fJywKICAgICAgYWN0aW9uOiAnam9pbicsCiAgICAgIGFwcGVhcmFuY2U6ICdpbnRlcmFjdGlvbi1vbmx5JywKICAgICAgY2FsbGJhY2s6IGZ1bmN0aW9uIChhKSB7CiAgICAgICAgd2luZG93Ll9fZGlhZy5ldmVudHMucHVzaCgnY2I6JyArIChhID09PSB1bmRlZmluZWQgPyAndW5kZWZpbmVkJyA6IChhID09PSAnJyA/ICdFTVBUWScgOiAnbGVuJyArIFN0cmluZyhhKS5sZW5ndGgpKSk7CiAgICAgIH0sCiAgICAgICdlcnJvci1jYWxsYmFjayc6ICBmdW5jdGlvbiAoYykgeyB3aW5kb3cuX19kaWFnLmV2ZW50cy5wdXNoKCdlcnI6JyArIGMpOyB9LAogICAgICAnZXhwaXJlZC1jYWxsYmFjayc6ZnVuY3Rpb24gKCkgIHsgd2luZG93Ll9fZGlhZy5ldmVudHMucHVzaCgnZXhwaXJlZCcpOyB9LAogICAgICAndGltZW91dC1jYWxsYmFjayc6ZnVuY3Rpb24gKCkgIHsgd2luZG93Ll9fZGlhZy5ldmVudHMucHVzaCgndGltZW91dCcpOyB9LAogICAgICAnYmVmb3JlLWludGVyYWN0aXZlLWNhbGxiYWNrJzogZnVuY3Rpb24gKCkgeyB3aW5kb3cuX19kaWFnLmV2ZW50cy5wdXNoKCdiZWZvcmUtaW50ZXJhY3RpdmUnKTsgfSwKICAgICAgJ2FmdGVyLWludGVyYWN0aXZlLWNhbGxiYWNrJzogIGZ1bmN0aW9uICgpIHsgd2luZG93Ll9fZGlhZy5ldmVudHMucHVzaCgnYWZ0ZXItaW50ZXJhY3RpdmUnKTsgfQogICAgfSk7CiAgICB3aW5kb3cuX19sYW5lc1tpXSA9IGlkOwogICAgcmV0dXJuIGlkOwogIH07CiAgd2luZG93Ll9fcmVhZExhbmUgPSBmdW5jdGlvbiAoaSkgewogICAgdHJ5IHsgdmFyIHQgPSB3aW5kb3cudHVybnN0aWxlLmdldFJlc3BvbnNlKHdpbmRvdy5fX2xhbmVzW2ldKTsgaWYgKHQpIHJldHVybiB0OyB9IGNhdGNoIChlKSB7fQogICAgdmFyIGVsID0gZG9jdW1lbnQucXVlcnlTZWxlY3RvcignI2xhbmVfJyArIGkgKyAnIGlucHV0W25hbWU9ImNmLXR1cm5zdGlsZS1yZXNwb25zZSJdJyk7CiAgICByZXR1cm4gKGVsICYmIGVsLnZhbHVlKSA/IGVsLnZhbHVlIDogbnVsbDsKICB9OwogIHdpbmRvdy5fX3JlY3ljbGUgPSBmdW5jdGlvbiAoaSkgewogICAgdHJ5IHsgd2luZG93LnR1cm5zdGlsZS5yZW1vdmUod2luZG93Ll9fbGFuZXNbaV0pOyB9IGNhdGNoIChlKSB7fQogICAgdmFyIGQgPSBkb2N1bWVudC5nZXRFbGVtZW50QnlJZCgnbGFuZV8nICsgaSk7CiAgICBpZiAoZCAmJiBkLnBhcmVudE5vZGUpIGQucGFyZW50Tm9kZS5yZW1vdmVDaGlsZChkKTsKICAgIHJldHVybiB3aW5kb3cuX19ta0xhbmUoaSk7CiAgfTsKICB3aW5kb3cuX19pZnJhbWVzID0gZnVuY3Rpb24gKCkgeyByZXR1cm4gZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnI2xhbmVzIGlmcmFtZScpLmxlbmd0aDsgfTsKfSkoKTsKIiIiCgoKZGVmIHBvc3RfdG9rZW4ocmVsYXlfdXJsOiBzdHIsIHNlY3JldDogc3RyLCB0b2tlbjogc3RyKSAtPiBzdHI6CiAgICByZXEgPSB1cmxsaWIucmVxdWVzdC5SZXF1ZXN0KAogICAgICAgIHJlbGF5X3VybCwKICAgICAgICBkYXRhPWpzb24uZHVtcHMoeyJ0b2tlbiI6IHRva2VufSkuZW5jb2RlKCksCiAgICAgICAgaGVhZGVycz17IkNvbnRlbnQtVHlwZSI6ICJhcHBsaWNhdGlvbi9qc29uIiwgIlgtQXV0aCI6IHNlY3JldH0sCiAgICAgICAgbWV0aG9kPSJQT1NUIiwKICAgICkKICAgIHRyeToKICAgICAgICB3aXRoIHVybGxpYi5yZXF1ZXN0LnVybG9wZW4ocmVxLCB0aW1lb3V0PTE1KSBhcyByOgogICAgICAgICAgICByZXR1cm4gZiJ7ci5zdGF0dXN9IgogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiAgIyBub3FhOiBCTEUwMDEg4oCUIGFueSBmYWlsdXJlIGlzIGp1c3QgcmVwb3J0ZWQKICAgICAgICByZXR1cm4gZiJFUlIge3R5cGUoZSkuX19uYW1lX199IgoKCmFzeW5jIGRlZiBydW4oYXJncykgLT4gaW50OgogICAgbWludGVkID0gMAogICAgc3RhcnRlZCA9IHRpbWUubW9ub3RvbmljKCkKICAgIGdhcCA9IDYwLjAgLyBhcmdzLnJhdGUgaWYgYXJncy5yYXRlID4gMCBlbHNlIDAuMAogICAgbmV4dF9hbGxvd2VkID0gMC4wCgogICAgYXN5bmMgd2l0aCBBc3luY0NhbW91Zm94KGhlYWRsZXNzPWFyZ3MuaGVhZGxlc3MsIGh1bWFuaXplPVRydWUsIG9zPSgid2luZG93cyIsKSkgYXMgYnJvd3NlcjoKICAgICAgICBwYWdlID0gYXdhaXQgYnJvd3Nlci5uZXdfcGFnZSgpCgogICAgICAgIGFzeW5jIGRlZiByb3V0ZShyKToKICAgICAgICAgICAgcmVxID0gci5yZXF1ZXN0CiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgIGlmICJjaGFsbGVuZ2VzLmNsb3VkZmxhcmUuY29tIiBpbiByZXEudXJsOgogICAgICAgICAgICAgICAgICAgIGF3YWl0IHIuY29udGludWVfKCkKICAgICAgICAgICAgICAgIGVsaWYgcmVxLnJlc291cmNlX3R5cGUgPT0gImRvY3VtZW50IiBhbmQgcmVxLmZyYW1lID09IHBhZ2UubWFpbl9mcmFtZToKICAgICAgICAgICAgICAgICAgICBhd2FpdCByLmZ1bGZpbGwoc3RhdHVzPTIwMCwgY29udGVudF90eXBlPSJ0ZXh0L2h0bWw7IGNoYXJzZXQ9dXRmLTgiLCBib2R5PVNUVUJfSFRNTCkKICAgICAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICAgICAgYXdhaXQgci5hYm9ydCgpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgICAgICBwYXNzCgogICAgICAgIGF3YWl0IHBhZ2Uucm91dGUoIioqLyoiLCByb3V0ZSkKICAgICAgICBhd2FpdCBwYWdlLmdvdG8oVEFSR0VUX1VSTCwgd2FpdF91bnRpbD0iZG9tY29udGVudGxvYWRlZCIsIHRpbWVvdXQ9NjBfMDAwKQoKICAgICAgICAjIElmIHdpbmRvdy50dXJuc3RpbGUgbmV2ZXIgYXBwZWFycywgc2F5IHNvIHBsYWlubHkgYW5kIHN0b3AgZ3Vlc3NpbmcuCiAgICAgICAgdHJ5OgogICAgICAgICAgICBhd2FpdCBwYWdlLndhaXRfZm9yX2Z1bmN0aW9uKCJ0eXBlb2Ygd2luZG93LnR1cm5zdGlsZSAhPT0gJ3VuZGVmaW5lZCciLCB0aW1lb3V0PTQ1XzAwMCkKICAgICAgICAgICAgcHJpbnQoIltkaWFnXSB3aW5kb3cudHVybnN0aWxlIGFwcGVhcmVkIiwgZmx1c2g9VHJ1ZSkKICAgICAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgICAgICBwcmludCgiW2RpYWddIEZBVEFMOiB3aW5kb3cudHVybnN0aWxlIE5FVkVSIGFwcGVhcmVkIOKAlCBDbG91ZGZsYXJlIGRpZCBub3QgIgogICAgICAgICAgICAgICAgICAiaW5pdGlhbGlzZSB0aGUgd2lkZ2V0IGluIHRoaXMgYnJvd3Nlci4gTm90aGluZyBlbHNlIGNhbiB3b3JrLiIsIGZsdXNoPVRydWUpCiAgICAgICAgICAgIHJldHVybiAwCgogICAgICAgIGF3YWl0IHBhZ2UuZXZhbHVhdGUoQk9PVFNUUkFQX0pTLnJlcGxhY2UoIl9fU0lURUtFWV9fIiwgU0lURUtFWSkpCiAgICAgICAgZm9yIGkgaW4gcmFuZ2UoYXJncy5sYW5lcyk6CiAgICAgICAgICAgIGF3YWl0IHBhZ2UuZXZhbHVhdGUoIihpKT0+d2luZG93Ll9fbWtMYW5lKGkpIiwgaSkKICAgICAgICBwcmludChmIltkaWFnXSB7YXJncy5sYW5lc30gbGFuZShzKSByZW5kZXJlZCIsIGZsdXNoPVRydWUpCgogICAgICAgIGxhc3RfcmVwb3J0ID0gdGltZS5tb25vdG9uaWMoKQogICAgICAgIGxhbmVfc2luY2UgPSBbdGltZS5tb25vdG9uaWMoKV0gKiBhcmdzLmxhbmVzCiAgICAgICAgZGVhZGxpbmUgPSB0aW1lLm1vbm90b25pYygpICsgYXJncy5kdXJhdGlvbiBpZiBhcmdzLmR1cmF0aW9uIGVsc2UgTm9uZQoKICAgICAgICB3aGlsZSBkZWFkbGluZSBpcyBOb25lIG9yIHRpbWUubW9ub3RvbmljKCkgPCBkZWFkbGluZToKICAgICAgICAgICAgYXdhaXQgYXN5bmNpby5zbGVlcCgxLjApCiAgICAgICAgICAgIG5vdyA9IHRpbWUubW9ub3RvbmljKCkKCiAgICAgICAgICAgIGZvciBpIGluIHJhbmdlKGFyZ3MubGFuZXMpOgogICAgICAgICAgICAgICAgdG9rID0gYXdhaXQgcGFnZS5ldmFsdWF0ZSgiKGkpPT53aW5kb3cuX19yZWFkTGFuZShpKSIsIGkpCiAgICAgICAgICAgICAgICBpZiB0b2s6CiAgICAgICAgICAgICAgICAgICAgaWYgbm93IDwgbmV4dF9hbGxvd2VkOgogICAgICAgICAgICAgICAgICAgICAgICBjb250aW51ZSAgIyBob2xkIGl0OyBwYWNpbmcgZ2F0ZQogICAgICAgICAgICAgICAgICAgIG1pbnRlZCArPSAxCiAgICAgICAgICAgICAgICAgICAgbmV4dF9hbGxvd2VkID0gbWF4KG5vdywgbmV4dF9hbGxvd2VkKSArIGdhcAogICAgICAgICAgICAgICAgICAgIHN0YXR1cyA9IHBvc3RfdG9rZW4oYXJncy5yZWxheV91cmwsIGFyZ3MuYXV0aF9zZWNyZXQsIHRvaykgaWYgYXJncy5yZWxheV91cmwgZWxzZSAibm90LXBvc3RlZCIKICAgICAgICAgICAgICAgICAgICByYXRlID0gbWludGVkIC8gbWF4KDAuMDEsIChub3cgLSBzdGFydGVkKSAvIDYwLjApCiAgICAgICAgICAgICAgICAgICAgcHJpbnQoZiJbdG9rZW5dICN7bWludGVkfSBsZW49e2xlbih0b2spfSBoZWFkPXt0b2tbOjE4XX3igKYgcmVsYXk9e3N0YXR1c30gIgogICAgICAgICAgICAgICAgICAgICAgICAgIGYicmF0ZT17cmF0ZTouMWZ9L21pbiIsIGZsdXNoPVRydWUpCiAgICAgICAgICAgICAgICAgICAgYXdhaXQgcGFnZS5ldmFsdWF0ZSgiKGkpPT53aW5kb3cuX19yZWN5Y2xlKGkpIiwgaSkKICAgICAgICAgICAgICAgICAgICBsYW5lX3NpbmNlW2ldID0gbm93CiAgICAgICAgICAgICAgICBlbGlmIG5vdyAtIGxhbmVfc2luY2VbaV0gPiBhcmdzLmlkbGVfbGltaXQ6CiAgICAgICAgICAgICAgICAgICAgYXdhaXQgcGFnZS5ldmFsdWF0ZSgiKGkpPT53aW5kb3cuX19yZWN5Y2xlKGkpIiwgaSkKICAgICAgICAgICAgICAgICAgICBsYW5lX3NpbmNlW2ldID0gbm93CgogICAgICAgICAgICBpZiBub3cgLSBsYXN0X3JlcG9ydCA+PSAzMDoKICAgICAgICAgICAgICAgIGRpYWcgPSBhd2FpdCBwYWdlLmV2YWx1YXRlKCIoKT0+KHtldjogd2luZG93Ll9fZGlhZy5ldmVudHMuc2xpY2UoLTgpLCBpZnI6IHdpbmRvdy5fX2lmcmFtZXMoKX0pIikKICAgICAgICAgICAgICAgIHByaW50KGYiW2RpYWddIHQ9e2ludChub3cgLSBzdGFydGVkKX1zIG1pbnRlZD17bWludGVkfSBpZnJhbWVzPXtkaWFnWydpZnInXX0gIgogICAgICAgICAgICAgICAgICAgICAgZiJldmVudHM9e2RpYWdbJ2V2J119IiwgZmx1c2g9VHJ1ZSkKICAgICAgICAgICAgICAgIGlmIG1pbnRlZCA9PSAwIGFuZCAiYmVmb3JlLWludGVyYWN0aXZlIiBpbiBkaWFnWyJldiJdIGFuZCBkaWFnWyJpZnIiXSA9PSAwOgogICAgICAgICAgICAgICAgICAgIHByaW50KCJbZGlhZ10gXiBDbG91ZGZsYXJlIGFza2VkIGZvciBJTlRFUkFDVElPTiBidXQgcmVuZGVyZWQgbm8gaWZyYW1lLiAiCiAgICAgICAgICAgICAgICAgICAgICAgICAgIk5vdGhpbmcgdG8gY2xpY2suIFRoaXMgYnJvd3NlciBjYW5ub3QgbWludCBmb3IgdGhpcyBzaXRla2V5LiIsIGZsdXNoPVRydWUpCiAgICAgICAgICAgICAgICBsYXN0X3JlcG9ydCA9IG5vdwoKICAgIHByaW50KGYiW3N1bW1hcnldIG1pbnRlZD17bWludGVkfSBpbiB7aW50KHRpbWUubW9ub3RvbmljKCkgLSBzdGFydGVkKX1zIiwgZmx1c2g9VHJ1ZSkKICAgIHJldHVybiBtaW50ZWQKCgpkZWYgbWFpbigpIC0+IGludDoKICAgIGFwID0gYXJncGFyc2UuQXJndW1lbnRQYXJzZXIoKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLXJlbGF5LXVybCIsIGRlZmF1bHQ9b3MuZW52aXJvbi5nZXQoIlJFTEFZX1VSTCIsICIiKSkKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1hdXRoLXNlY3JldCIsIGRlZmF1bHQ9b3MuZW52aXJvbi5nZXQoIkFVVEhfU0VDUkVUIiwgIiIpKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLWxhbmVzIiwgdHlwZT1pbnQsIGRlZmF1bHQ9MikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1yYXRlIiwgdHlwZT1mbG9hdCwgZGVmYXVsdD0xMi4wLCBoZWxwPSJ0b2tlbnMvbWluIGNlaWxpbmcgKDAgPSB1bmxpbWl0ZWQpIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1kdXJhdGlvbiIsIHR5cGU9ZmxvYXQsIGRlZmF1bHQ9MCwgaGVscD0ic2Vjb25kcyAoMCA9IGZvcmV2ZXIpIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1pZGxlLWxpbWl0IiwgdHlwZT1mbG9hdCwgZGVmYXVsdD00NS4wKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLWhlYWRsZXNzIiwgYWN0aW9uPWFyZ3BhcnNlLkJvb2xlYW5PcHRpb25hbEFjdGlvbiwgZGVmYXVsdD1UcnVlKQogICAgYXJncyA9IGFwLnBhcnNlX2FyZ3MoKQogICAgcmV0dXJuIDAgaWYgYXN5bmNpby5ydW4ocnVuKGFyZ3MpKSA+PSAwIGVsc2UgMQoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICByYWlzZSBTeXN0ZW1FeGl0KG1haW4oKSkK'
+        run: |
+          sudo mkdir -p /opt/camoufox
+          sudo chown "$USER":"$USER" /opt/camoufox
+          echo "$GEN_B64" | base64 -d > /opt/camoufox/generator_v2.py
+          wc -c /opt/camoufox/generator_v2.py
+
+      - name: 3. Install camoufox (LATEST, not the old 0.4.11 pin)
+        working-directory: /opt/camoufox
+        run: |
+          # ubuntu-24.04 ships Python 3.12, so pip can resolve camoufox 0.5.x —
+          # the launcher that actually matches the v152 browser that
+          # `camoufox fetch` downloads. The producer workflow pins
+          # camoufox==0.4.11 (Jan 2025) while fetching a Jul 2026 browser, an
+          # 18-month mismatch. Let pip pick a matched pair here.
+          python3 -m venv venv
+          ./venv/bin/python -m pip install --quiet --upgrade pip
+          ./venv/bin/python -m pip install --quiet "camoufox[geoip]"
+          ./venv/bin/python -m pip show camoufox playwright | grep -E "^Name|^Version"
+          ./venv/bin/python -m camoufox fetch
+          ./venv/bin/python - <<'EOF'
+          import glob, os
+          hits = glob.glob(os.path.expanduser("~/.cache/camoufox/camoufox-bin"))
+          print("browser binary:", hits or "NOT FOUND")
+          EOF
+
+      - name: 4. Probe — does it mint on a GitHub IP?
+        working-directory: /opt/camoufox
+        env:
+          # Optional. With no secret configured the probe still answers the
+          # minting question; it just does not forward tokens to the relay.
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+        run: |
+          echo "runner egress IP: $(curl -s https://api.ipify.org || echo unknown)"
+          RELAY=""
+          if [ -n "$AUTH_SECRET" ]; then RELAY="https://mohanadino.duckdns.org:8443/add"; fi
+          echo "relay: ${RELAY:-<not posting, no AUTH_SECRET secret set>}"
+          MIN="${{ github.event.inputs.minutes || '10' }}"
+          LANES="${{ github.event.inputs.lanes || '2' }}"
+          PYTHONUNBUFFERED=1 ./venv/bin/python -u generator_v2.py             --lanes "$LANES"             --duration "$(( MIN * 60 ))"             --rate 0             --relay-url "$RELAY"             --auth-secret "$AUTH_SECRET"
+
+      - name: 5. Verdict
+        if: always()
+        run: |
+          echo "Read step 4's log:"
+          echo "  [token] lines            -> Camoufox CAN mint on a GitHub IP. The block is IP/reputation-based."
+          echo "  'window.turnstile NEVER appeared' -> Cloudflare refused to initialise the widget at all."
+          echo "  'before-interactive' + iframes=0  -> challenge demanded interaction and rendered nothing."
+          echo "                                       Same as the Oracle VM: automation detection, not IP."
