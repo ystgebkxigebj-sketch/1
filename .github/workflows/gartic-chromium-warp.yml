@@ -53,6 +53,16 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      browser:
+        # cft136 mints ZERO with no `cf err` at all -- the challenge neither
+        # errors nor solves, which is not the AS8075 signature (that is loud
+        # 600010). Turnstile is known to weigh browser build age, and 136 is
+        # far behind the VM's Chromium 148 that mints fine. `playwright` gets a
+        # CURRENT Chromium, which unlike branded Chrome still honours
+        # --load-extension when the feature flag is turned off.
+        description: "playwright (modern Chromium, recommended) or cft136 (old, native --load-extension)"
+        required: false
+        default: "playwright"
 
 jobs:
   produce:
@@ -73,11 +83,28 @@ jobs:
           google-chrome --version || true
           chromium --version || true
 
-      - name: 2. Install Xvfb + a Chrome that still honours --load-extension
+      - name: 2. Install Xvfb + a browser that still honours --load-extension
+        env:
+          BROWSER: ${{ github.event.inputs.browser }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends xvfb unzip
+
+          if [ "${BROWSER:-playwright}" = "playwright" ]; then
+            # A CURRENT Chromium. Branded Chrome removed --load-extension in
+            # M137 outright, but Chromium only gates it behind a feature flag,
+            # which step 6 turns off. Playwright is used purely as a download
+            # channel here -- the browser is launched by us, with no CDP and no
+            # driver attached, which is the whole point of this recipe.
+            npx --yes playwright@latest install --with-deps chromium >/dev/null 2>&1 || \
+              npx --yes playwright@latest install chromium
+            BIN=$(find "$HOME/.cache/ms-playwright" -type f -name chrome -path '*chrome-linux*' | head -1)
+            [ -n "$BIN" ] || { echo 'playwright chromium not found' >&2; exit 1; }
+            echo "CHROME_BIN=$BIN" >> "$GITHUB_ENV"
+            "$BIN" --version
+            exit 0
+          fi
 
           # The runner's preinstalled Chrome is 150. Chrome REMOVED
           # --load-extension in M137 (and the
@@ -337,7 +364,16 @@ jobs:
           echo "=============================================="
           grep -a 'cf err' "$LOG" | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
           if [ "$MINTED" -eq 0 ]; then
-            echo "::error::minted 0 -- check 'cf err' codes above (600010=ASN/browser refused, 300030=exit collision)"
+            # The producer's own console lines live in $LOG and were previously
+            # never surfaced, so a zero-mint run showed nothing to diagnose --
+            # not even whether window.turnstile appeared. Dump them (never a
+            # TOKFULL line; the repo is public).
+            echo "--- producer console (deduped) ---"
+            grep -a 'producer\]' "$LOG" | grep -av 'TOKFULL' \
+              | sed 's/.*\[producer\]/[producer]/' \
+              | sed 's/len=[0-9]* head=.*/len=... head=.../' \
+              | sort | uniq -c | sort -rn | head -20
+            echo "::error::minted 0. No 'cf err' at all means the challenge never errored AND never solved -- suspect the browser build, not the exit IP."
           fi
 
       - name: 7. Dispatch successor
