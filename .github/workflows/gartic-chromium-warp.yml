@@ -164,9 +164,22 @@ jobs:
           chmod +x warp_up.sh
 
           : > /tmp/tunnels.txt
-          # Each exit already taken is refused for the next roll -- two producers
-          # behind ONE exit is measurably fatal (one sustains, the other gets
-          # nothing but 300030), so fewer tunnels beats duplicated ones.
+          # Claimed exits are deliberately NOT added to the forbid list. WARP's
+          # IPv4 is anycast and a runner pins to ONE: run 30347933726 rolled five
+          # fresh registrations and drew 104.28.196.79 every time, only the IPv6
+          # /64 varying, so a v4 forbid-list rejected every roll and gave 1
+          # tunnel of 3. (The "five runs, five exits" pattern that suggested
+          # otherwise was variance BETWEEN runners, not between registrations on
+          # one runner.)
+          #
+          # Whether tunnels sharing a v4 still scale is the open question this
+          # now measures: memory warp-netns-multiplies-token-exits recorded 3
+          # WARP lanes at 106.6 tok/min on the VM, while
+          # vm-chromium-producer/README.md asserts shared-exit lanes cannot
+          # multiply the ceiling. If the limit keys on the WARP registration
+          # (fresh every roll) they scale; if it keys on the v4 they will not --
+          # and the per-instance rates in [result] say which, instead of leaving
+          # it to inference.
           CLAIMED="${FORBID:-}"
           for n in $(seq 0 $(( TUNNELS - 1 ))); do
             d=/tmp/warp/$n; mkdir -p "$d"; cp -f /tmp/warp/warp_up.sh "$d/"
@@ -182,7 +195,6 @@ jobs:
             colo=$(sed -n 's/^colo=//p'   "$d/out.txt" | tail -1)
             if [ -n "$v4" ] && [ "$v4" != "none" ] && [ "$v4" != "FAILED" ]; then
               echo "$n $port $v4 ${colo:-unknown}" >> /tmp/tunnels.txt
-              CLAIMED="${CLAIMED:+$CLAIMED,}$v4"
               echo "tunnel $n  port=$port  exit=$v4  colo=${colo:-unknown}  v6=${v6:-none}"
             else
               echo "tunnel $n FAILED to register (rc=$rc) -- continuing with fewer"
@@ -559,6 +571,10 @@ jobs:
             m=$(grep -ac 'TOKFULL ' "/tmp/chrome-$n.log" 2>/dev/null); m=${m:-0}
             echo "inst $n  exit=$v4 ($colo)  minted=$m  rate=$(( m * 60 / EL ))/min"
           done
+          # If the per-instance rates hold up while this says 1, the ceiling
+          # keys on the WARP registration, not the exit address -- and shared-v4
+          # lanes are a legitimate way to scale one runner.
+          echo "distinct exit v4s: $(awk '{print $3}' /tmp/tunnels.txt | sort -u | wc -l) across $NINST instance(s)"
           echo "--- interactive-mode callbacks ---"
           for pat in BEFORE_INTERACTIVE AFTER_INTERACTIVE; do
             echo "$pat: $(sum_over "$pat")"
