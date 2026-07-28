@@ -61,9 +61,20 @@ on:
         # symptom: getResponse() returns a full-length token (mint counter
         # rises) and gartic then refuses it code=5. So click realism may affect
         # ACCEPTANCE, not just whether a token appears.
-        description: "human (eased multi-step path, jitter, overshoot, press-hold) or simple (3-hop teleport)"
+        # MEASURED A/B, 3 tunnels, ~20 min apart on rested exits:
+        #   simple -> 364 minted, 29/min, 12/12 accepted, 401 clicks
+        #   human  -> 193 minted, 16/min, 10/11 accepted, 217 clicks
+        # Realism bought nothing on a rested exit and cost 45% of production:
+        # each human click issues 20+ synced mousemoves plus an awk spawn, so
+        # the driver lands about half as many clicks per cycle and tokens track
+        # clicks nearly 1:1. Depletion does not explain it (cumulative ~557 here
+        # vs ~2000 when decay set in). Default back to `simple`; `human` stays
+        # for the untested case that matters -- whether it extends the budget on
+        # a DEPLETED exit, which is where the operator saw a hand click succeed
+        # and a synthetic one fail.
+        description: "simple (3-hop teleport, faster) or human (eased path, jitter, press-hold)"
         required: false
-        default: "human"
+        default: "simple"
       verify_every:
         # Seconds between acceptance checks. 180 gives only ~4 samples in a
         # 12-minute run, which cannot separate a real acceptance drop from
