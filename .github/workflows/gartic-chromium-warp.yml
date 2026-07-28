@@ -335,11 +335,20 @@ jobs:
             // browser chrome above the page; the horizontal term splits any
             // window border evenly. Self-correcting, so the window can sit
             // anywhere without the click driver needing to know where.
+            //
+            // devicePixelRatio is NOT optional: getBoundingClientRect() and
+            // screenX are CSS pixels, while xdotool/XTEST address DEVICE pixels.
+            // On a 175%-scaled display this error put the click ~1000px off the
+            // widget -- which looks exactly like Cloudflare refusing us, the
+            // same silent-failure shape that has already caused two multi-day
+            // misdiagnoses here. Xvfb runs at 1x so the runner never saw it.
             function toScreen(r) {
+              var dpr = window.devicePixelRatio || 1;
               var padX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
               var padY = Math.max(0, window.outerHeight - window.innerHeight);
-              return { x: Math.round((window.screenX || 0) + padX + r.left),
-                       y: Math.round((window.screenY || 0) + padY + r.top) };
+              return { x: Math.round(((window.screenX || 0) + padX + r.left) * dpr),
+                       y: Math.round(((window.screenY || 0) + padY + r.top) * dpr),
+                       dpr: dpr };
             }
 
             function lane(i) {
@@ -348,6 +357,12 @@ jobs:
                 sawInter = false;
                 slot = document.createElement('div');
                 slot.id = 'prod_' + i;
+                // The class off-the-shelf Turnstile helpers look for. Our own
+                // driver finds the widget by rect and does not need it, but a
+                // bench measured stock helpers at 3/3 on a classed widget and
+                // 0/2 on a bare div -- so this one line keeps any future
+                // clicker (SeleniumBase's, or a CDP one) able to find us.
+                slot.className = 'cf-turnstile';
                 slot.style.cssText = 'position:fixed;left:' + (10 + i*320) + 'px;bottom:10px;z-index:2147483647';
                 document.body.appendChild(slot);
                 try {
@@ -379,21 +394,26 @@ jobs:
                 // The checkbox sits at the left end of an expanded widget; on a
                 // small box aim at its centre instead.
                 var ox = r.width >= 200 ? 30 : Math.round(r.width / 2);
-                var cx = p.x + ox, cy = p.y + Math.round(r.height / 2);
+                // Offsets are CSS pixels too, so they scale with the rest.
+                var cx = p.x + Math.round(ox * p.dpr),
+                    cy = p.y + Math.round((r.height / 2) * p.dpr);
                 // An off-screen window yields absurd screen coords (a bench log
                 // showed CLICKAT x=-18246 y=-17578). The pointer then lands
                 // nowhere, the widget is never clicked, and the run looks
                 // exactly like "Cloudflare refused us" -- a silent failure of
                 // precisely the kind that has already cost this project two
                 // multi-day misdiagnoses. Refuse to emit, and say why.
-                var sw = (window.screen && window.screen.width)  || 1280;
-                var sh = (window.screen && window.screen.height) || 900;
+                // screen.width/height are CSS pixels as well -- compare like
+                // with like, or the bounds check itself misfires on HiDPI.
+                var sw = Math.round(((window.screen && window.screen.width)  || 1280) * p.dpr);
+                var sh = Math.round(((window.screen && window.screen.height) || 900)  * p.dpr);
                 if (cx < 0 || cy < 0 || cx > sw || cy > sh) {
                   log('CLICKOFFSCREEN lane=' + i + ' x=' + cx + ' y=' + cy +
-                      ' screen=' + sw + 'x' + sh + ' -- window is off-screen, not clicking');
+                      ' screen=' + sw + 'x' + sh + ' dpr=' + p.dpr +
+                      ' -- window is off-screen, not clicking');
                   return;
                 }
-                log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy);
+                log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy + ' dpr=' + p.dpr);
               }
               function poll(n) {
                 var t = read();
