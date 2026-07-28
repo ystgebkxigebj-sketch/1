@@ -53,6 +53,39 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      rotate_fp:
+        # The operator's experience, from running this a year ago: a single
+        # browser instance decays after a while and its tokens stop being
+        # accepted even though Cloudflare keeps issuing them -- and Camoufox was
+        # the only thing that fixed it. A bench confirmed the mechanism is real:
+        # across 4 Camoufox launches, canvasHash and webglRenderer differed
+        # EVERY time while userAgent/platform/timezone stayed constant. So it
+        # re-rolls precisely the high-entropy vectors.
+        # Chromium never re-rolls anything, and --user-agent/--window-size/--lang
+        # CANNOT reach canvas or WebGL, which is why this lives in the extension
+        # rather than in flags.
+        #
+        # ⚠️ MEASURED AND IT DOES NOT WORK. Controlled local A/B, same IP, same
+        # 10-minute window, control run LAST (so most depleted):
+        #     canvas + WebGL + cores spoof -> 0 minted
+        #     canvas noise alone           -> 0 minted
+        #     no rotation (control)        -> 20 minted, 4/4 accepted, no cf err
+        # Cloudflare detects a JS-level canvas patch and simply stops issuing --
+        # not "issues tokens gartic then refuses", but no tokens at all. You
+        # cannot fake this from inside the page: any override is visible to the
+        # same JS that reads it. Camoufox patches at the C++/Gecko level, which
+        # is exactly why it can rotate identity and this cannot.
+        # KEEP THIS false. It is retained only to document the negative.
+        description: "BROKEN - JS canvas/WebGL spoofing stops Cloudflare issuing entirely. Keep false."
+        required: false
+        default: "false"
+      recycle_min:
+        # Rotation only helps if it actually happens again. Reloading the page
+        # re-runs the content script with a fresh seed, which is far cheaper
+        # than restarting Chromium and loses only the in-flight widgets.
+        description: "Reload each page every N minutes to draw a fresh identity (0 = never)"
+        required: false
+        default: "0"
       click_style:
         # The operator observed, on a degraded IP, that a HAND click on the
         # checkbox succeeded where the synthetic one did not. Cloudflare can
@@ -92,17 +125,27 @@ on:
         required: false
         default: "true"
       tunnels:
-        # Rate is capped PER EXIT IP (~12-14 tok/min issuance; gartic refuses
-        # everything above ~12/min from one IP), so throughput scales with exit
-        # IPs and nothing else -- not lanes, not per_min. On a runner each fresh
-        # anonymous WARP registration draws a DIFFERENT exit: five runs took
-        # 104.28.216.161/MSP, .227.110/ORD, .201.80/SJC, .221.80, .216.157/DFW.
-        # So N tunnels x 1 Chromium each ~= N x 12 tok/min on one runner.
-        # (The VM's "all WARP namespaces share one exit" note does NOT hold here.)
-        # 4 vCPU is the real ceiling: each instance is a Chromium + an Xvfb.
-        description: "Independent WARP tunnels, each its own exit IP + browser. Throughput scales with this."
+        # NOTE: an earlier version of this comment claimed the ceiling was "per
+        # EXIT IP, and throughput scales with exit IPs and nothing else". That
+        # was wrong twice over -- WARP's v4 is anycast so a runner pins to only
+        # 1-2 exits no matter how many tunnels, yet 6 tunnels still scale fine.
+        # The quota keys on storage IDENTITY, not address. 4 vCPU remains the
+        # ceiling on instance count (each is a Chromium plus an Xvfb).
+        #
+        # MEASURED over two 60-minute runs. Each tunnel is a separate browser
+        # with its own --user-data-dir, i.e. its own cookie/storage identity, and
+        # gartic's acceptance quota keys on IDENTITY, not raw address:
+        #   3 tunnels -> 30/min, 43/58 accepted; quota wall at ~900 tokens,
+        #                then a ~15-minute penalty mid-run, then recovery
+        #   6 tunnels -> 52/min, 54/59 accepted; NO wall at all -- 2,800 tokens
+        #                clean, the only refusals being leftover penalty from the
+        #                previous run's exit in the first ~6 minutes
+        # This is the mechanism the year-old Camoufox generator used deliberately
+        # (7 BrowserContexts per browser: "Cloudflare scores each context as a
+        # distinct user sharing the IP"). More identities per exit = more quota.
+        description: "Independent WARP tunnels, each its own browser AND storage identity. Quota scales with this."
         required: false
-        default: "3"
+        default: "6"
       browser:
         # cft136 mints ZERO with no `cf err` at all -- the challenge neither
         # errors nor solves, which is not the AS8075 signature (that is loud
@@ -271,6 +314,8 @@ jobs:
           PER_MIN: ${{ github.event.inputs.per_min }}
           POST_TO_RELAY: ${{ github.event.inputs.post_to_relay }}
           STRIP_DOM: ${{ github.event.inputs.strip_dom }}
+          ROTATE_FP: ${{ github.event.inputs.rotate_fp }}
+          RECYCLE_MIN: ${{ github.event.inputs.recycle_min }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/ext
@@ -317,6 +362,8 @@ jobs:
             var PER_MIN = __PER_MIN__;
             var POST = __POST__;
             var STRIP = __STRIP__;
+            var ROTATE_FP = __ROTATE__;
+            var RECYCLE_MIN = __RECYCLE__;
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
 
@@ -472,6 +519,69 @@ jobs:
             // -- we do not need its UI. Dropping the DOM frees that CPU for
             // solving. window.turnstile is already captured and lives on, and
             // the lanes render into elements we create ourselves.
+            // Re-roll the two vectors Camoufox actually varies. Measured across
+            // 4 Camoufox launches: canvasHash 4/4 distinct, webglRenderer 4/4
+            // distinct, while userAgent/platform/timezone stayed constant.
+            // Noise is deliberately tiny -- flip the low bit of a handful of
+            // pixels -- so the canvas still renders correctly and only its hash
+            // moves. A heavy-handed spoof is itself a detection signal.
+            function rotateFingerprint() {
+              var seed = (Math.random() * 2147483647) | 0;
+              function rnd(n) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }
+
+              try {
+                var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                var origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+                function perturb(d) {
+                  var px = d.data.length >> 2;
+                  for (var k = 0; k < 8 && px > 0; k++) {
+                    var idx = rnd(px) << 2;
+                    d.data[idx] = d.data[idx] ^ 1;
+                  }
+                  return d;
+                }
+                CanvasRenderingContext2D.prototype.getImageData = function () {
+                  return perturb(origGetImageData.apply(this, arguments));
+                };
+                HTMLCanvasElement.prototype.toDataURL = function () {
+                  try {
+                    var c = this.getContext && this.getContext('2d');
+                    if (c && this.width && this.height) {
+                      c.putImageData(perturb(origGetImageData.call(c, 0, 0, this.width, this.height)), 0, 0);
+                    }
+                  } catch (e) {}
+                  return origToDataURL.apply(this, arguments);
+                };
+              } catch (e) { log('fp canvas patch failed', e && e.message); }
+
+              // 37445 = UNMASKED_VENDOR_WEBGL, 37446 = UNMASKED_RENDERER_WEBGL.
+              var GPUS = [
+                ['Google Inc. (Intel)',  'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'],
+                ['Google Inc. (NVIDIA)', 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0, D3D11)'],
+                ['Google Inc. (AMD)',    'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)'],
+                ['Intel Inc.',           'Intel Iris OpenGL Engine']
+              ];
+              var gpu = GPUS[rnd(GPUS.length)];
+              try {
+                [window.WebGLRenderingContext, window.WebGL2RenderingContext].forEach(function (C) {
+                  if (!C || !C.prototype) return;
+                  var orig = C.prototype.getParameter;
+                  C.prototype.getParameter = function (p) {
+                    if (p === 37445) return gpu[0];
+                    if (p === 37446) return gpu[1];
+                    return orig.apply(this, arguments);
+                  };
+                });
+              } catch (e) { log('fp webgl patch failed', e && e.message); }
+
+              try {
+                var cores = [2, 4, 8, 12, 16][rnd(5)];
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: function () { return cores; } });
+              } catch (e) {}
+
+              log('FP rotated gpu=' + gpu[1].slice(0, 30));
+            }
+
             function stripPage() {
               try {
                 document.body.innerHTML = '';
@@ -485,7 +595,18 @@ jobs:
             (function wait() {
               if (window.turnstile && window.turnstile.render) {
                 log('turnstile present -- starting', LANES, 'lanes');
+                // Rotate BEFORE rendering any widget, or the challenge reads the
+                // real canvas/WebGL and the rotation buys nothing.
+                if (ROTATE_FP) rotateFingerprint();
                 if (STRIP) stripPage();
+                // A page reload re-runs this content script with a fresh seed,
+                // i.e. a fresh identity, without paying to restart Chromium.
+                if (RECYCLE_MIN > 0) {
+                  setTimeout(function () {
+                    log('RECYCLE reloading for a fresh identity');
+                    location.reload();
+                  }, RECYCLE_MIN * 60000);
+                }
                 for (var i = 0; i < LANES; i++) setTimeout(lane(i), i * 800);
                 return;
               }
@@ -497,7 +618,10 @@ jobs:
 
           if [ "$POST_TO_RELAY" = "true" ]; then POSTJS=true; else POSTJS=false; fi
           if [ "${STRIP_DOM:-true}" = "true" ]; then STRIPJS=true; else STRIPJS=false; fi
-          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|" /tmp/ext/producer.js
+          if [ "${ROTATE_FP:-false}" = "true" ]; then ROTJS=true; else ROTJS=false; fi
+          RECJS="${RECYCLE_MIN:-0}"
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|" /tmp/ext/producer.js
+          echo "rotate_fp=$ROTJS recycle_min=$RECJS"
           grep -c . /tmp/ext/producer.js
 
       - name: 6. Mint
