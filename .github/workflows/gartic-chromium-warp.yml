@@ -379,7 +379,21 @@ jobs:
                 // The checkbox sits at the left end of an expanded widget; on a
                 // small box aim at its centre instead.
                 var ox = r.width >= 200 ? 30 : Math.round(r.width / 2);
-                log('CLICKAT lane=' + i + ' x=' + (p.x + ox) + ' y=' + (p.y + Math.round(r.height / 2)));
+                var cx = p.x + ox, cy = p.y + Math.round(r.height / 2);
+                // An off-screen window yields absurd screen coords (a bench log
+                // showed CLICKAT x=-18246 y=-17578). The pointer then lands
+                // nowhere, the widget is never clicked, and the run looks
+                // exactly like "Cloudflare refused us" -- a silent failure of
+                // precisely the kind that has already cost this project two
+                // multi-day misdiagnoses. Refuse to emit, and say why.
+                var sw = (window.screen && window.screen.width)  || 1280;
+                var sh = (window.screen && window.screen.height) || 900;
+                if (cx < 0 || cy < 0 || cx > sw || cy > sh) {
+                  log('CLICKOFFSCREEN lane=' + i + ' x=' + cx + ' y=' + cy +
+                      ' screen=' + sw + 'x' + sh + ' -- window is off-screen, not clicking');
+                  return;
+                }
+                log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy);
               }
               function poll(n) {
                 var t = read();
@@ -703,6 +717,8 @@ jobs:
               | sed 's/.*\[producer\]/[producer]/' \
               | sed 's/len=[0-9]* head=.*/len=... head=.../' \
               | sort | uniq -c | sort -rn | head -20
+              echo "--- off-screen click refusals (window mispositioned) ---"
+            sum_over 'CLICKOFFSCREEN'
             echo "--- clicks issued ---"; cat /tmp/clicks-*.log 2>/dev/null | tail -5
             echo "::error::minted 0. Read it off the counters above: clicks=0 means the widget never became clickable (CLICKAT never fired -- lane stayed collapsed); clicks>0 with BEFORE_INTERACTIVE>0 and AFTER_INTERACTIVE=0 means the click landed but Cloudflare still refused this browser/exit."
           fi
