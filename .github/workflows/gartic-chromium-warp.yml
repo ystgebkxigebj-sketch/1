@@ -53,6 +53,13 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      strip_dom:
+        # Throughput on a runner is CPU-bound (3 and 5 tunnels both total
+        # 27/min), and most of that CPU is gartic's animated Next.js homepage,
+        # not Turnstile. We need the origin and window.turnstile, not the UI.
+        description: "Drop gartic's DOM once turnstile is captured, to free CPU for solving"
+        required: false
+        default: "true"
       tunnels:
         # Rate is capped PER EXIT IP (~12-14 tok/min issuance; gartic refuses
         # everything above ~12/min from one IP), so throughput scales with exit
@@ -232,6 +239,7 @@ jobs:
           LANES: ${{ github.event.inputs.lanes }}
           PER_MIN: ${{ github.event.inputs.per_min }}
           POST_TO_RELAY: ${{ github.event.inputs.post_to_relay }}
+          STRIP_DOM: ${{ github.event.inputs.strip_dom }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/ext
@@ -277,6 +285,7 @@ jobs:
             var LANES  = __LANES__;
             var PER_MIN = __PER_MIN__;
             var POST = __POST__;
+            var STRIP = __STRIP__;
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
 
@@ -390,10 +399,28 @@ jobs:
                   ' posted=' + posted + ' | ' + parts.join(' | '));
             }, 20000);
 
+            // gartic's homepage is a heavy Next.js app that animates
+            // continuously, and on a runner the binding constraint is CPU: 3
+            // tunnels and 5 tunnels both total 27/min, with per-instance rate
+            // falling 9 -> 5 as instances are added. We need this origin (the
+            // siteverify hostname must be gartic.io) and its window.turnstile
+            // -- we do not need its UI. Dropping the DOM frees that CPU for
+            // solving. window.turnstile is already captured and lives on, and
+            // the lanes render into elements we create ourselves.
+            function stripPage() {
+              try {
+                document.body.innerHTML = '';
+                document.body.style.cssText = 'background:#202020;margin:0';
+                if (document.title) document.title = 'p';
+                log('page stripped for CPU');
+              } catch (e) { log('strip failed', e && e.message); }
+            }
+
             var waited = 0;
             (function wait() {
               if (window.turnstile && window.turnstile.render) {
                 log('turnstile present -- starting', LANES, 'lanes');
+                if (STRIP) stripPage();
                 for (var i = 0; i < LANES; i++) setTimeout(lane(i), i * 800);
                 return;
               }
@@ -404,7 +431,8 @@ jobs:
           PRODUCER
 
           if [ "$POST_TO_RELAY" = "true" ]; then POSTJS=true; else POSTJS=false; fi
-          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|" /tmp/ext/producer.js
+          if [ "${STRIP_DOM:-true}" = "true" ]; then STRIPJS=true; else STRIPJS=false; fi
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|" /tmp/ext/producer.js
           grep -c . /tmp/ext/producer.js
 
       - name: 6. Mint
