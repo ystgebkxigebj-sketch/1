@@ -53,6 +53,24 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      appearance:
+        # We copied appearance:'interaction-only' from gartic's own client, but
+        # we are not gartic's client -- we only need tokens that pass siteverify
+        # with action:'join'. How the widget LOOKS is our choice, and this mode
+        # is expensive: it stays invisible until Cloudflare demands interaction,
+        # which on a datacenter IP is EVERY time (measured: 100% solve=int on
+        # runners). Every solve then costs a click and is scrutinised, capping
+        # an exit near 12 tok/min.
+        #
+        # The year-old Camoufox generator set NO appearance -- the default
+        # managed widget, which auto-solves with no click -- and sustained
+        # ~47 tok/min per IP, 4x what we get. That is the workaround this input
+        # exists to test. ('always' renders the widget visibly and lets it
+        # self-solve; the click driver is skipped in that mode, since clicking a
+        # widget that is already solving only interferes.)
+        description: "interaction-only (invisible, needs a click) or always (visible, self-solving)"
+        required: false
+        default: "interaction-only"
       rotate_fp:
         # The operator's experience, from running this a year ago: a single
         # browser instance decays after a while and its tokens stop being
@@ -316,6 +334,7 @@ jobs:
           STRIP_DOM: ${{ github.event.inputs.strip_dom }}
           ROTATE_FP: ${{ github.event.inputs.rotate_fp }}
           RECYCLE_MIN: ${{ github.event.inputs.recycle_min }}
+          APPEARANCE: ${{ github.event.inputs.appearance }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/ext
@@ -364,6 +383,7 @@ jobs:
             var STRIP = __STRIP__;
             var ROTATE_FP = __ROTATE__;
             var RECYCLE_MIN = __RECYCLE__;
+            var APPEARANCE = '__APPEARANCE__';
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
 
@@ -414,7 +434,7 @@ jobs:
                 document.body.appendChild(slot);
                 try {
                   id = window.turnstile.render(slot, {
-                    sitekey: KEY, action: 'join', appearance: 'interaction-only',
+                    sitekey: KEY, action: 'join', appearance: APPEARANCE,
                     callback: function(){},
                     'error-callback': function(c){ log('cf err', c); setTimeout(recycle, 2000); },
                     'before-interactive-callback': function(){ sawInter = true; log('BEFORE_INTERACTIVE (lane '+i+')'); },
@@ -620,7 +640,8 @@ jobs:
           if [ "${STRIP_DOM:-true}" = "true" ]; then STRIPJS=true; else STRIPJS=false; fi
           if [ "${ROTATE_FP:-false}" = "true" ]; then ROTJS=true; else ROTJS=false; fi
           RECJS="${RECYCLE_MIN:-0}"
-          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|" /tmp/ext/producer.js
+          APPJS="${APPEARANCE:-interaction-only}"
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|" /tmp/ext/producer.js
           echo "rotate_fp=$ROTJS recycle_min=$RECJS"
           grep -c . /tmp/ext/producer.js
 
@@ -631,6 +652,7 @@ jobs:
           MINUTES: ${{ github.event.inputs.minutes }}
           VERIFY_EVERY: ${{ github.event.inputs.verify_every }}
           CLICK_STYLE: ${{ github.event.inputs.click_style }}
+          APPEARANCE: ${{ github.event.inputs.appearance }}
         run: |
           # GitHub invokes every step as `bash -e`, and `set -uo pipefail` does
           # NOT clear that. A monitoring loop must not be fatal: `grep -c`
@@ -770,8 +792,14 @@ jobs:
               last=$total
             done
           }
+          # A self-solving widget must not be clicked -- interfering with a
+          # challenge that is already completing only breaks it.
           CLICKERS=()
-          for n in "${IDX[@]}"; do click_driver "$n" & CLICKERS+=($!); done
+          if [ "${APPEARANCE:-interaction-only}" = "interaction-only" ]; then
+            for n in "${IDX[@]}"; do click_driver "$n" & CLICKERS+=($!); done
+          else
+            echo "appearance=${APPEARANCE} -- click driver disabled (widget self-solves)"
+          fi
 
           sum_over() {   # $1 = grep pattern, counted across every instance log
             local s=0 c
