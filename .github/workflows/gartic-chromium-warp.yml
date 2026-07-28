@@ -637,6 +637,21 @@ jobs:
             echo "::error::minted 0. Read it off the counters above: clicks=0 means the widget never became clickable (CLICKAT never fired -- lane stayed collapsed); clicks>0 with BEFORE_INTERACTIVE>0 and AFTER_INTERACTIVE=0 means the click landed but Cloudflare still refused this browser/exit."
           fi
 
+          # Explicit teardown, AFTER the result is printed. Leaving the browsers,
+          # displays and tunnels to the runner's own orphan reaper wedged run
+          # 30353621246 in post-job cleanup for 28+ minutes on a 12-minute job --
+          # and the logs of a run that has to be cancelled are truncated, so the
+          # measurement is lost outright. A hung job also holds a concurrency
+          # slot, which the ~6-12 min runner drip-feed makes expensive.
+          echo "tearing down $NINST instance(s)"
+          for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+          sleep 2
+          for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
+          pkill -f 'Xvfb :9' 2>/dev/null
+          pkill -f 'wireproxy -c' 2>/dev/null
+          echo "teardown done"
+          exit 0
+
       - name: 7. Dispatch successor
         if: ${{ always() && github.event.inputs.chain == 'true' }}
         env:
