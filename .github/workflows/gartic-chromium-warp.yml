@@ -44,9 +44,15 @@ on:
         required: false
         default: "false"
       forbid_exits:
-        description: "Comma-separated WARP exit IPs to refuse (avoid collisions)"
+        # Empty by DEFAULT and it must stay that way. WARP's IPv4 is anycast --
+        # every lane shares one address (the VM's lanes all sit on
+        # 104.28.196.79) and only the IPv6 /64 actually differs. Seeding this
+        # with a v4 makes warp_up.sh reject every roll and fail the job: an
+        # earlier run burned all 4 rolls on 104.28.196.79/IAD for exactly that
+        # reason. Put a v6 prefix here if a real collision needs excluding.
+        description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
-        default: "104.28.196.79,104.28.196.78"
+        default: ""
 
 jobs:
   produce:
