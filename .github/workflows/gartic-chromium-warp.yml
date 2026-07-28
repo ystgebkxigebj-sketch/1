@@ -133,6 +133,10 @@ jobs:
       - name: 3. Bring up Cloudflare WARP (SOCKS5) -- FATAL if it fails
         env:
           WARP_FORBID_EXITS: ${{ github.event.inputs.forbid_exits }}
+          # Registration is flaky on runners: one run burned all 4 default rolls
+          # and reported exit_v4=none, failing a job whose browser was fine.
+          # Rolls are cheap (a fresh anonymous registration), the job is not.
+          WARP_MAX_ROLLS: "10"
         run: |
           set -euo pipefail
           mkdir -p /tmp/warp && cd /tmp/warp
