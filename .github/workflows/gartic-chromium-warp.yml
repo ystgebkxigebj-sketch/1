@@ -143,27 +143,33 @@ on:
         required: false
         default: "true"
       tunnels:
-        # NOTE: an earlier version of this comment claimed the ceiling was "per
-        # EXIT IP, and throughput scales with exit IPs and nothing else". That
-        # was wrong twice over -- WARP's v4 is anycast so a runner pins to only
-        # 1-2 exits no matter how many tunnels, yet 6 tunnels still scale fine.
-        # The quota keys on storage IDENTITY, not address. 4 vCPU remains the
-        # ceiling on instance count (each is a Chromium plus an Xvfb).
+        # ⚠️ RETRACTED 2026-07-29: the "43/58 and 54/59 accepted" figures below
+        # were produced by THIS WORKFLOW'S OWN VERIFIER, which replays each
+        # token through the WARP tunnel that minted it. A token from an
+        # over-driven exit still passes when redeemed from that same exit, so
+        # the instrument was blind to the exact failure it was measuring. It
+        # reported 54/59 accepted while icebot was refused 100% code 5 and
+        # production was down for an hour.
         #
-        # MEASURED over two 60-minute runs. Each tunnel is a separate browser
-        # with its own --user-data-dir, i.e. its own cookie/storage identity, and
-        # gartic's acceptance quota keys on IDENTITY, not raw address:
-        #   3 tunnels -> 30/min, 43/58 accepted; quota wall at ~900 tokens,
-        #                then a ~15-minute penalty mid-run, then recovery
-        #   6 tunnels -> 52/min, 54/59 accepted; NO wall at all -- 2,800 tokens
-        #                clean, the only refusals being leftover penalty from the
-        #                previous run's exit in the first ~6 minutes
-        # This is the mechanism the year-old Camoufox generator used deliberately
-        # (7 BrowserContexts per browser: "Cloudflare scores each context as a
-        # distinct user sharing the IP"). More identities per exit = more quota.
-        description: "Independent WARP tunnels, each its own browser AND storage identity. Quota scales with this."
+        # RE-MEASURED with icebot's real joins as ground truth:
+        #   1 tunnel  (~11/min per exit) -> 53 joins /    3 code-5  ✅
+        #   3 tunnels (~33/min, ONE IP)  -> 27 joins /  175 code-5  ❌ 86% fail
+        #   6 tunnels x 20 workers       ->  0 joins / 1041 code-5  ❌ outage
+        #
+        # WARP's IPv4 is anycast: 5 fresh registrations on one runner all drew
+        # 104.28.196.79. So N tunnels is NOT N exits, it is N times the traffic
+        # on ONE address, and gartic rate-limits acceptance per solving IP at
+        # roughly 12 accepted tok/min. The "quota keys on storage identity"
+        # claim is withdrawn -- those 6 tunnels were 6 separate browsers with 6
+        # separate --user-data-dirs, i.e. six distinct storage identities, and
+        # they still collapsed.
+        #
+        # Scale by adding EXITS (more runners at 1 tunnel), not tunnels. Verify
+        # per exit at https://mohanadino.duckdns.org:8443/stats/exits, which
+        # scores each minting IP against icebot's real join verdicts.
+        description: "Browsers per runner. WARP's v4 is anycast so these SHARE one exit -- above 1 you are just overdriving it."
         required: false
-        default: "6"
+        default: "1"
       browser:
         # cft136 mints ZERO with no `cf err` at all -- the challenge neither
         # errors nor solves, which is not the AS8075 signature (that is loud
@@ -384,16 +390,22 @@ jobs:
             var ROTATE_FP = __ROTATE__;
             var RECYCLE_MIN = __RECYCLE__;
             var APPEARANCE = '__APPEARANCE__';
+            var LABEL = '__LABEL__';
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
 
             function log(){ console.log.apply(console, ['[producer]'].concat([].slice.call(arguments))); }
 
+            // The POST goes through this browser's WARP tunnel, so the relay
+            // sees the minting exit as the TCP peer and scores that exit
+            // against icebot's real join verdicts (/stats/exits). LABEL is
+            // only a convenience for mapping an exit back to a run -- the relay
+            // never keys on it, because a producer could choose it.
             function post(tok) {
               if (!POST) { posted++; return; }
               fetch(RELAY, { method:'POST',
                 headers:{'Content-Type':'application/json','X-Auth':SECRET},
-                body: JSON.stringify({token: tok})
+                body: JSON.stringify({token: tok, label: LABEL})
               }).then(function(r){ if(r.ok){posted++;} log('posted', r.status, 'minted='+minted, 'posted='+posted); })
                 .catch(function(e){ log('relay error', e && e.message); });
             }
@@ -641,7 +653,8 @@ jobs:
           if [ "${ROTATE_FP:-false}" = "true" ]; then ROTJS=true; else ROTJS=false; fi
           RECJS="${RECYCLE_MIN:-0}"
           APPJS="${APPEARANCE:-interaction-only}"
-          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|" /tmp/ext/producer.js
+          LABELJS="gh-${GITHUB_RUN_ID:-unknown}"
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|; s|__LABEL__|$LABELJS|" /tmp/ext/producer.js
           echo "rotate_fp=$ROTJS recycle_min=$RECJS"
           grep -c . /tmp/ext/producer.js
 
@@ -840,8 +853,15 @@ jobs:
               LINE=$(grep -a 'TOKFULL ' "$vlog" | tail -1 | sed 's/.*TOKFULL //' | sed 's/".*$//' | tr -d '\r')
               FLAG=${LINE%% *}; TOK=${LINE#* }
               if [ -n "$TOK" ] && [ "$TOK" != "$LINE" ]; then
-                # Verify through the SAME tunnel the token was minted on, so the
-                # check never introduces an exit the token did not come from.
+                # ⚠️ SAME-PATH BLIND -- this number is a MINT sanity check, not
+                # an acceptance measurement. Redeeming through the tunnel that
+                # minted the token means an exit being rate-limited for
+                # over-production still passes its own replay: on 2026-07-28
+                # this line printed 54/59 ACCEPTED while icebot, redeeming the
+                # same queue from Webshare proxies, was refused 100% code 5 and
+                # production was down.
+                # Real acceptance, per minting exit:
+                #   https://mohanadino.duckdns.org:8443/stats/exits
                 V=$(/tmp/joinverify -proxy "socks5://127.0.0.1:$vport" "$TOK" 2>&1 | tail -1)
                 verified=$(( verified + 1 ))
                 case "$V" in JOINED*) accepted=$(( accepted + 1 ));; esac
@@ -858,7 +878,7 @@ jobs:
           CLICKS=$(cat /tmp/clicks-*.log 2>/dev/null | grep -ac '^\[click\]'); CLICKS=${CLICKS:-0}
           EL=$(( $(date +%s) - (END - MINUTES*60) )); [ "$EL" -lt 1 ] && EL=1
           echo "=============================================="
-          echo "[result] instances=$NINST minted=$MINTED rate=$(( MINTED * 60 / EL ))/min clicks=$CLICKS accepted=$accepted/$verified"
+          echo "[result] instances=$NINST minted=$MINTED rate=$(( MINTED * 60 / EL ))/min clicks=$CLICKS same-path-replay=$accepted/$verified (NOT acceptance -- see /stats/exits)"
           echo "=============================================="
           echo "--- per instance ---"
           for t in "${TUNS[@]}"; do
