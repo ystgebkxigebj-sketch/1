@@ -53,6 +53,17 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      click_style:
+        # The operator observed, on a degraded IP, that a HAND click on the
+        # checkbox succeeded where the synthetic one did not. Cloudflare can
+        # hand back a token client-side and still fail it at siteverify if it
+        # judged the interaction fraudulent -- which looks exactly like our
+        # symptom: getResponse() returns a full-length token (mint counter
+        # rises) and gartic then refuses it code=5. So click realism may affect
+        # ACCEPTANCE, not just whether a token appears.
+        description: "human (eased multi-step path, jitter, overshoot, press-hold) or simple (3-hop teleport)"
+        required: false
+        default: "human"
       verify_every:
         # Seconds between acceptance checks. 180 gives only ~4 samples in a
         # 12-minute run, which cannot separate a real acceptance drop from
@@ -450,6 +461,7 @@ jobs:
         env:
           MINUTES: ${{ github.event.inputs.minutes }}
           VERIFY_EVERY: ${{ github.event.inputs.verify_every }}
+          CLICK_STYLE: ${{ github.event.inputs.click_style }}
         run: |
           # GitHub invokes every step as `bash -e`, and `set -uo pipefail` does
           # NOT clear that. A monitoring loop must not be fatal: `grep -c`
@@ -458,6 +470,8 @@ jobs:
           set +e +o pipefail
           MINUTES="${MINUTES:-300}"
           VERIFY_EVERY="${VERIFY_EVERY:-180}"
+          CLICK_STYLE="${CLICK_STYLE:-human}"
+          echo "click style: $CLICK_STYLE"
           mapfile -t TUNS < /tmp/tunnels.txt
           NINST=${#TUNS[@]}
           echo "starting $NINST producer instance(s) -- one browser per exit IP"
@@ -521,6 +535,50 @@ jobs:
           # what this whole no-automation-protocol recipe exists to avoid.
           # Positions come from the extension's CLICKAT lines (screen coords),
           # so nothing here has to guess where the widget is.
+          # A synthetic click is not automatically as good as a human one. The
+          # operator watched a hand click succeed on a widget where the machine
+          # click failed, so the pointer path itself may be scored. `simple` is
+          # the original 3-hop teleport, kept so the two can be A/B'd.
+          simple_click() {
+            local x="$1" y="$2"
+            xdotool mousemove --sync $(( x - 40 )) $(( y - 25 )) sleep 0.12 \
+                    mousemove --sync $(( x - 12 )) $(( y - 6 ))  sleep 0.09 \
+                    mousemove --sync "$x" "$y" sleep 0.18 click 1 >/dev/null 2>&1
+          }
+          human_click() {
+            local tx="$1" ty="$2" args hold
+            # Approach from a random angle and distance so no two clicks trace
+            # the same path; ease-in-out cubic, per-step jitter, and a slight
+            # overshoot that is then corrected -- humans do not land exactly.
+            # bash has no floats, so awk computes the path.
+            args=$(awk -v tx="$tx" -v ty="$ty" -v seed="$RANDOM$idx" '
+              BEGIN{
+                srand(seed); pi=3.14159265;
+                ang = rand()*360; dist = 80 + rand()*140; steps = 14 + int(rand()*8);
+                sx = tx + dist*cos(ang*pi/180); sy = ty + dist*sin(ang*pi/180);
+                # Keep the approach origin on-screen (Xvfb is 1280x900).
+                # xdotool clamps out-of-range coords, which would start the
+                # path pinned against a screen edge -- the opposite of subtle.
+                if (sx < 5) sx = 5; if (sx > 1275) sx = 1275;
+                if (sy < 5) sy = 5; if (sy > 895) sy = 895;
+                ox = tx + (rand()*8-4); oy = ty + (rand()*6-3);
+                for (i=1; i<=steps; i++) {
+                  t = i/steps;
+                  e = (t<0.5) ? 4*t*t*t : 1-((-2*t+2)^3)/2;
+                  printf "mousemove --sync %d %d sleep %.3f ",
+                         sx+(ox-sx)*e + (rand()*2.4-1.2),
+                         sy+(oy-sy)*e + (rand()*2.4-1.2),
+                         0.008+rand()*0.022;
+                }
+                printf "mousemove --sync %d %d sleep %.3f ", tx, ty, 0.09+rand()*0.14;
+              }')
+            # Humans hold the button ~60-140ms; xdotool `click` is about 12ms.
+            hold=$(awk -v s="$RANDOM" 'BEGIN{srand(s); printf "%.3f", 0.06+rand()*0.08}')
+            xdotool $args mousedown 1 >/dev/null 2>&1
+            sleep "$hold"
+            xdotool mouseup 1 >/dev/null 2>&1
+          }
+
           click_driver() {
             local idx="$1" log="/tmp/chrome-$1.log" last=0 total
             export DISPLAY=":$(( 97 + idx ))"
@@ -533,10 +591,11 @@ jobs:
                 | awk '{print $2, $3, $4}' | sed 's/[a-z]*=//g' | sort -u -k1,1 \
                 | while read -r ln x y; do
                     [ -n "$x" ] && [ -n "$y" ] || continue
-                    # An approach path with pauses reads less like a teleport.
-                    xdotool mousemove --sync $(( x - 40 )) $(( y - 25 )) sleep 0.12 \
-                            mousemove --sync $(( x - 12 )) $(( y - 6 ))  sleep 0.09 \
-                            mousemove --sync "$x" "$y" sleep 0.18 click 1 >/dev/null 2>&1
+                    if [ "$CLICK_STYLE" = "simple" ]; then
+                      simple_click "$x" "$y"
+                    else
+                      human_click "$x" "$y"
+                    fi
                     echo "[click] inst=$idx lane=$ln at $x,$y" >> "/tmp/clicks-$idx.log"
                   done
               last=$total
