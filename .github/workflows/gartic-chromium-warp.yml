@@ -53,6 +53,15 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      verify_every:
+        # Seconds between acceptance checks. 180 gives only ~4 samples in a
+        # 12-minute run, which cannot separate a real acceptance drop from
+        # noise -- 4 tunnels scored 2/4 against 3 tunnels' 4/4 and that is not
+        # a decidable difference. Each check spends one token (they are
+        # single-use), which at 30+/min is under 2% of production.
+        description: "Seconds between acceptance checks. Lower = more samples, costs one token each."
+        required: false
+        default: "180"
       strip_dom:
         # Throughput on a runner is CPU-bound (3 and 5 tunnels both total
         # 27/min), and most of that CPU is gartic's animated Next.js homepage,
@@ -440,6 +449,7 @@ jobs:
         continue-on-error: true
         env:
           MINUTES: ${{ github.event.inputs.minutes }}
+          VERIFY_EVERY: ${{ github.event.inputs.verify_every }}
         run: |
           # GitHub invokes every step as `bash -e`, and `set -uo pipefail` does
           # NOT clear that. A monitoring loop must not be fatal: `grep -c`
@@ -447,6 +457,7 @@ jobs:
           # this step 30s in, before the first token had been minted.
           set +e +o pipefail
           MINUTES="${MINUTES:-300}"
+          VERIFY_EVERY="${VERIFY_EVERY:-180}"
           mapfile -t TUNS < /tmp/tunnels.txt
           NINST=${#TUNS[@]}
           echo "starting $NINST producer instance(s) -- one browser per exit IP"
@@ -559,7 +570,7 @@ jobs:
             # Verify one fresh token every ~3 min, ROTATING instances so every
             # exit gets checked. Tokens are single-use, so a verified one is
             # spent -- keep this sparse. Never print the token.
-            if [ $(( NOW - lastcheck )) -ge 180 ] && [ "$MINTED" -gt 0 ]; then
+            if [ $(( NOW - lastcheck )) -ge "$VERIFY_EVERY" ] && [ "$MINTED" -gt 0 ]; then
               lastcheck=$NOW
               vi=$(( vturn % NINST )); vturn=$(( vturn + 1 ))
               vlog="${LOGS[$vi]}"; vport="${PORTS[$vi]}"; vn="${IDX[$vi]}"
