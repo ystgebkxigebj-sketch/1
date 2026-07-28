@@ -255,7 +255,11 @@ jobs:
         env:
           MINUTES: ${{ github.event.inputs.minutes }}
         run: |
-          set -uo pipefail
+          # GitHub invokes every step as `bash -e`, and `set -uo pipefail` does
+          # NOT clear that. A monitoring loop must not be fatal: `grep -c`
+          # exits 1 when the count is zero, so `MINTED=$(grep -ac ...)` killed
+          # this step 30s in, before the first token had been minted.
+          set +e +o pipefail
           export DISPLAY=:97
           Xvfb :97 -screen 0 1280x900x24 -ac -nolisten tcp >/dev/null 2>&1 &
           sleep 3
@@ -302,8 +306,8 @@ jobs:
 
             # grep -c always prints a number but exits 1 on no match, so a
             # `|| echo 0` fallback would capture "0\n0" and break the arithmetic.
-            MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null); MINTED=${MINTED:-0}
-            POSTED=$(grep -ao 'posted=[0-9]*' "$LOG" 2>/dev/null | tail -1); POSTED=${POSTED:-posted=0}
+            MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null || true); MINTED=${MINTED:-0}
+            POSTED=$(grep -ao 'posted=[0-9]*' "$LOG" 2>/dev/null | tail -1 || true); POSTED=${POSTED:-posted=0}
             NOW=$(date +%s)
             echo "[summary] t=$(( NOW - (END - MINUTES*60) ))s minted=$MINTED $POSTED accepted=$accepted/$verified exit=${EXITIP:-unknown}"
 
@@ -321,7 +325,7 @@ jobs:
             fi
           done
 
-          MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null); MINTED=${MINTED:-0}
+          MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null || true); MINTED=${MINTED:-0}
           echo "=============================================="
           echo "[result] exit_ip=${EXITIP:-unknown} minted=$MINTED accepted=$accepted/$verified"
           echo "=============================================="
