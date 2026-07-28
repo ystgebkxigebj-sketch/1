@@ -244,8 +244,9 @@ jobs:
             }
 
             function lane(i) {
-              var slot, id;
+              var slot, id, sawInter;
               function build() {
+                sawInter = false;
                 slot = document.createElement('div');
                 slot.id = 'prod_' + i;
                 slot.style.cssText = 'position:fixed;left:' + (10 + i*320) + 'px;bottom:10px;z-index:2147483647';
@@ -255,7 +256,7 @@ jobs:
                     sitekey: KEY, action: 'join', appearance: 'interaction-only',
                     callback: function(){},
                     'error-callback': function(c){ log('cf err', c); setTimeout(recycle, 2000); },
-                    'before-interactive-callback': function(){ log('BEFORE_INTERACTIVE (lane '+i+')'); },
+                    'before-interactive-callback': function(){ sawInter = true; log('BEFORE_INTERACTIVE (lane '+i+')'); },
                     'after-interactive-callback': function(){ log('AFTER_INTERACTIVE (lane '+i+')'); },
                     'timeout-callback': function(){ recycle(); }
                   });
@@ -288,8 +289,8 @@ jobs:
                   var wait = Math.max(0, nextAllowed - now);
                   nextAllowed = Math.max(now, nextAllowed) + GAP;
                   minted++;
-                  log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16));
-                  log('TOKFULL ' + t);
+                  log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16), 'solve='+(sawInter?'int':'auto'));
+                  log('TOKFULL ' + (sawInter ? 'int' : 'auto') + ' ' + t);
                   setTimeout(function(){ post(t); }, wait);
                   setTimeout(recycle, wait + 500);
                   return;
@@ -447,12 +448,24 @@ jobs:
             # verified one is spent -- keep this sparse. Never print the token.
             if [ $(( NOW - lastcheck )) -ge 180 ] && [ "$MINTED" -gt 0 ]; then
               lastcheck=$NOW
-              TOK=$(grep -a 'TOKFULL ' "$LOG" | tail -1 | sed 's/.*TOKFULL //' | tr -d '\r' | tr -d '"')
-              if [ -n "$TOK" ]; then
+              # Chrome's console log appends `", source: <url> (line)` to EVERY
+              # line. The old extraction was `tr -d '"'`, which deletes the quote
+              # characters but leaves that suffix glued onto the token -- so the
+              # verifier was replaying a corrupted string, and a corrupted token
+              # can only ever come back code=5. Cut at the first quote instead:
+              # the token alphabet is base64url plus dots, so it never contains
+              # one. This is why a 143-token run reported accepted=0/4.
+              LINE=$(grep -a 'TOKFULL ' "$LOG" | tail -1 | sed 's/.*TOKFULL //' | sed 's/".*$//' | tr -d '\r')
+              FLAG=${LINE%% *}; TOK=${LINE#* }
+              if [ -n "$TOK" ] && [ "$TOK" != "$LINE" ]; then
                 V=$(/tmp/joinverify -proxy "socks5://127.0.0.1:$SOCKS_PORT" "$TOK" 2>&1 | tail -1)
                 verified=$(( verified + 1 ))
                 case "$V" in JOINED*) accepted=$(( accepted + 1 ));; esac
-                echo "[verify] $V   (running $accepted/$verified ACCEPTED)"
+                # solve=int means this token came from a challenge that escalated
+                # to interactive and was clicked; solve=auto means it solved by
+                # itself. If int tokens are refused while auto ones are accepted,
+                # the click driver is producing tokens gartic will not take.
+                echo "[verify] solve=$FLAG len=${#TOK} $V   (running $accepted/$verified ACCEPTED)"
               fi
             fi
           done
@@ -466,6 +479,10 @@ jobs:
           echo "--- interactive-mode callbacks ---"
           for pat in BEFORE_INTERACTIVE AFTER_INTERACTIVE; do
             echo "$pat: $(grep -ac "$pat" "$LOG" 2>/dev/null || true)"
+          done
+          echo "--- tokens by solve path ---"
+          for pat in int auto; do
+            echo "solve=$pat: $(grep -ac "TOKFULL $pat " "$LOG" 2>/dev/null || true)"
           done
           grep -a 'cf err' "$LOG" | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
           if [ "$MINTED" -eq 0 ]; then
