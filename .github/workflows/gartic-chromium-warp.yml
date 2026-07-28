@@ -1,0 +1,327 @@
+name: Gartic producer (Chromium + MV3 extension, WARP)
+
+# Replaces the Camoufox producer fleet, which cannot mint any more:
+#
+#   1. Its egress is AS8075 Microsoft, which Cloudflare refuses the challenge to
+#      (measured 2026-07-24: direct 0 tokens / 93x 600010, WARP 238, VPN Gate 99).
+#   2. Its embedded generator renders WITHOUT `action:'join'`, and gartic
+#      validates that field server-side -- every such token is refused code 5.
+#   3. It pins `camoufox==0.4.11` but `camoufox fetch` now pulls v152, which
+#      yields zero tokens.
+#
+# This workflow is the GitHub port of the recipe that is live and minting on the
+# Oracle VM (`tunnel system/vm-chromium-producer/`): a PLAIN Chromium with no
+# automation protocol attached, doing the work from an MV3 content script in the
+# MAIN world, egressing through an anonymous Cloudflare WARP registration.
+#
+# On the diagnostic signature that misled the previous session: a healthy
+# producer logs `DIAG iframes=0` and fires `before-interactive`. That is what
+# `appearance:'interaction-only'` looks like, NOT a failure -- the live VM
+# producer prints exactly that while minting. Do not treat it as a verdict.
+# The only verdict that counts is the ACCEPTED ratio this workflow prints.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to mint for"
+        required: false
+        default: "300"
+      lanes:
+        description: "Parallel Turnstile widgets (2 is the measured optimum)"
+        required: false
+        default: "2"
+      per_min:
+        description: "Per-IP mint cap. Above ~12-14 gartic refuses everything."
+        required: false
+        default: "12"
+      post_to_relay:
+        description: "POST minted tokens to the relay (false = verify only)"
+        required: false
+        default: "true"
+      chain:
+        description: "Dispatch a successor when this run ends"
+        required: false
+        default: "false"
+      forbid_exits:
+        description: "Comma-separated WARP exit IPs to refuse (avoid collisions)"
+        required: false
+        default: "104.28.196.79,104.28.196.78"
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 358
+
+    env:
+      AUTH_SECRET: '74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434'
+      SITEKEY: '0x4AAAAAABBPKaIbNwnPEfSo'
+      RELAY: 'https://mohanadino.duckdns.org:8443/add'
+      SOCKS_PORT: '25344'
+
+    steps:
+      - name: 1. Runner facts (before any tunnel)
+        run: |
+          echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+          google-chrome --version || true
+          chromium --version || true
+
+      - name: 2. Install Xvfb (+ Chrome is preinstalled on ubuntu-24.04)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb
+          # ubuntu-24.04 runner images ship google-chrome-stable. Fall back to a
+          # direct .deb only if that ever stops being true -- NOT to the snap
+          # `chromium` package, whose confinement breaks --load-extension.
+          if ! command -v google-chrome >/dev/null; then
+            curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -y /tmp/chrome.deb
+          fi
+          google-chrome --version
+
+      - name: 3. Bring up Cloudflare WARP (SOCKS5) -- FATAL if it fails
+        env:
+          WARP_FORBID_EXITS: ${{ github.event.inputs.forbid_exits }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/warp && cd /tmp/warp
+          echo 'IyEvdXNyL2Jpbi9lbnYgYmFzaAojIEJyaW5nIHVwIENsb3VkZmxhcmUgV0FSUCBhcyBhIGxvY2FsIFNPQ0tTNSBsaXN0ZW5lciwgcmVwb3J0IHRoZSBleGl0LCBhbmQKIyByZWZ1c2UgdG8gaGFuZCBiYWNrIGEgdHVubmVsIHdob3NlIGV4aXQgY29sbGlkZXMgd2l0aCBvbmUgYWxyZWFkeSBpbiB1c2UuCiMKIyBTaGFyZWQgYnkgdGhlIGV4aXQtY2hhcmFjdGVyaXNhdGlvbiBwcm9iZSBhbmQgdGhlIHByb2R1Y3Rpb24gcHJvZHVjZXJzLCBzbyBhbGwKIyBvZiB0aGVtIGFyZSBndWFyYW50ZWVkIHRvIG1lYXN1cmUgdGhlIHNhbWUgdGhpbmcuCiMKIyBVc2FnZTogd2FycF91cC5zaCA8YmluZF9wb3J0PiBbZW5kcG9pbnRfaG9zdF0gW2VuZHBvaW50X3BvcnRdCiMKIyBFbnZpcm9ubWVudDoKIyAgIFdBUlBfRk9SQklEX0VYSVRTICBjb21tYS1zZXBhcmF0ZWQgZXhpdCBJUHMgb3IgSVAgcHJlZml4ZXMgdG8gcmVqZWN0LCBlLmcuCiMgICAgICAgICAgICAgICAgICAgICAgIjEwNC4yOC4xOTYuNzksMTA0LjI4LjIyMS4iIEEgcHJlZml4IGVuZGluZyBpbiAnLicKIyAgICAgICAgICAgICAgICAgICAgICBtYXRjaGVzIGJ5IHByZWZpeC4gT24gYSBtYXRjaCB0aGUgdHVubmVsIGlzIHRvcm4gZG93biBhbmQKIyAgICAgICAgICAgICAgICAgICAgICBhIEZSRVNIIHJlZ2lzdHJhdGlvbiBpcyBhdHRlbXB0ZWQuCiMgICBXQVJQX01BWF9ST0xMUyAgICAgaG93IG1hbnkgcmVnaXN0cmF0aW9ucyB0byB0cnkgYmVmb3JlIGdpdmluZyB1cCAoZGVmYXVsdCA0KQojCiMgV2h5IHRoZSBmb3JiaWQgbGlzdCBleGlzdHM6IFR1cm5zdGlsZSBzb2x2ZS1yYXRlIGlzIGNhcHBlZCBwZXIgZXhpdCBJUCwgbm90IHBlcgojIG1hY2hpbmUuIFR3byBwcm9kdWNlcnMgYmVoaW5kIG9uZSBleGl0IGlzIG1lYXN1cmFibHkgZmF0YWwg4oCUIG9uZSBzdXN0YWlucyB+NDkKIyB0b2svbWluIHdoaWxlIHRoZSBvdGhlciBnZXRzIG5vdGhpbmcgYnV0IENsb3VkZmxhcmUgMzAwMDMwLiBUd28gcnVubmVycyBkcmF3aW5nCiMgdGhlIHNhbWUgYW55Y2FzdCBleGl0IGlzIG5vdCBoeXBvdGhldGljYWw7IGl0IHdhcyBvYnNlcnZlZC4gU28gYW55IHNlY29uZAojIHByb2R1Y2VyLCBpbiB0aGlzIGxhbmUgb3IgYW5vdGhlciAodGhlIE9yYWNsZSBWTSBsYW5lIGFsc28gdXNlcyBXQVJQKSwgbXVzdCBiZQojIHRvbGQgd2hpY2ggZXhpdHMgYXJlIHRha2VuIGFuZCBkZWNsaW5lIHRoZW0uCiMKIyBQcmludHMgYGtleT12YWx1ZWAgbGluZXMgYW5kIGxlYXZlcyB3aXJlcHJveHkgcnVubmluZyBpbiB0aGUgYmFja2dyb3VuZC4gRXhpdHMKIyBub24temVybyBpZiBubyBhY2NlcHRhYmxlIHR1bm5lbCBjb3VsZCBiZSBlc3RhYmxpc2hlZCDigJQgY2FsbGVycyBNVVNUIHRyZWF0CiMgdGhhdCBhcyBmYXRhbCwgYmVjYXVzZSBmYWxsaW5nIHRocm91Z2ggdG8gdGhlIHJ1bm5lcidzIG93biBlZ3Jlc3MgbWVhbnMgbWludGluZwojIGZyb20gQVM4MDc1LCB3aGljaCB5aWVsZHMgbm90aGluZyBidXQgQ2xvdWRmbGFyZSA2MDAwMTAuCnNldCAtZXVvIHBpcGVmYWlsCgpCSU5EX1BPUlQ9IiR7MTo/YmluZCBwb3J0IHJlcXVpcmVkfSIKRU5EUE9JTlRfSE9TVD0iJHsyOi19IgpFTkRQT0lOVF9QT1JUPSIkezM6LX0iCkZPUkJJRD0iJHtXQVJQX0ZPUkJJRF9FWElUUzotfSIKTUFYX1JPTExTPSIke1dBUlBfTUFYX1JPTExTOi00fSIKCiMgVGhlIHJlbGVhc2UgQ0ROIDUwNHMgaW4gYnVyc3RzIHRoYXQgb3V0bGFzdCBhbnkgY3VybCAtLXJldHJ5IGJ1ZGdldC4KZGwoKSB7CiAgZm9yIGF0dGVtcHQgaW4gMSAyIDMgNCA1IDY7IGRvCiAgICBjdXJsIC1mc1NMIC0tcmV0cnkgMyAtLXJldHJ5LWRlbGF5IDMgLS1yZXRyeS1hbGwtZXJyb3JzIFwKICAgICAgLS1jb25uZWN0LXRpbWVvdXQgMjAgLW8gIiQyIiAiJDEiICYmIHJldHVybiAwCiAgICBlY2hvICJkb3dubG9hZCBhdHRlbXB0ICRhdHRlbXB0IGZvciAkMiBmYWlsZWQ7IGJhY2tpbmcgb2ZmIiA+JjIKICAgIHNsZWVwICQoKCBhdHRlbXB0ICogOCApKQogIGRvbmUKICByZXR1cm4gMQp9CgppZiBbWyAhIC14IC4vd2djZiBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9WaVJiMy93Z2NmL3JlbGVhc2VzL2Rvd25sb2FkL3YyLjIuMzIvd2djZl8yLjIuMzJfbGludXhfYW1kNjQgd2djZgogIGNobW9kICt4IHdnY2YKZmkKaWYgW1sgISAteCAuL3dpcmVwcm94eSBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9wdWZmZXJmZmlzaC93aXJlcHJveHkvcmVsZWFzZXMvZG93bmxvYWQvdjEuMS4zL3dpcmVwcm94eV9saW51eF9hbWQ2NC50YXIuZ3ogd2lyZXByb3h5LnRhci5negogIHRhciB4emYgd2lyZXByb3h5LnRhci5negpmaQoKIyBEb2VzICQxIG1hdGNoIGFueSBlbnRyeSBpbiB0aGUgY29tbWEtc2VwYXJhdGVkICRGT1JCSUQgbGlzdD8gQW4gZW50cnkgZW5kaW5nCiMgaW4gJy4nIGlzIHRyZWF0ZWQgYXMgYSBwcmVmaXggc28gYSB3aG9sZSAvMjQtaXNoIGJsb2NrIGNhbiBiZSByZXNlcnZlZC4KaXNfZm9yYmlkZGVuKCkgewogIGxvY2FsIGlwPSIkMSIgZW50cnkKICBbWyAteiAiJEZPUkJJRCIgXV0gJiYgcmV0dXJuIDEKICBsb2NhbCBJRlM9JywnCiAgZm9yIGVudHJ5IGluICRGT1JCSUQ7IGRvCiAgICBlbnRyeT0iJHtlbnRyeS8vIC99IgogICAgW1sgLXogIiRlbnRyeSIgXV0gJiYgY29udGludWUKICAgIGlmIFtbICIkZW50cnkiID09ICouIF1dOyB0aGVuCiAgICAgIFtbICIkaXAiID09ICIkZW50cnkiKiBdXSAmJiByZXR1cm4gMAogICAgZWxzZQogICAgICBbWyAiJGlwIiA9PSAiJGVudHJ5IiBdXSAmJiByZXR1cm4gMAogICAgZmkKICBkb25lCiAgcmV0dXJuIDEKfQoKZXhpdF9pcD0iIjsgY29sbz0iIjsgd2FycD0iIjsgbG9jPSIiOyByb2xsPTAKd2hpbGUgKCggcm9sbCA8IE1BWF9ST0xMUyApKTsgZG8KICByb2xsPSQoKCByb2xsICsgMSApKQogIHBraWxsIC1mICd3aXJlcHJveHkgLWMnIDI+L2Rldi9udWxsIHx8IHRydWUKICBzbGVlcCAxCgogICMgQSBmcmVzaCBhbm9ueW1vdXMgcmVnaXN0cmF0aW9uIGVhY2ggcm9sbDogbm8gc2lnbnVwLCBubyBjcmVkZW50aWFscy4gRGVsZXRpbmcKICAjIHRoZSBhY2NvdW50IGZpbGUgaXMgd2hhdCBtYWtlcyBpdCBmcmVzaCByYXRoZXIgdGhhbiByZXVzZWQuCiAgcm0gLWYgd2djZi1hY2NvdW50LnRvbWwgd2djZi1wcm9maWxlLmNvbmYKICAuL3dnY2YgcmVnaXN0ZXIgLS1hY2NlcHQtdG9zID4vZGV2L251bGwKICAuL3dnY2YgZ2VuZXJhdGUgPi9kZXYvbnVsbAoKICBjcCB3Z2NmLXByb2ZpbGUuY29uZiB3cC5jb25mCiAgaWYgW1sgLW4gIiRFTkRQT0lOVF9IT1NUIiBdXTsgdGhlbgogICAgc2VkIC1pICJzfF5FbmRwb2ludCAqPS4qfEVuZHBvaW50ID0gJHtFTkRQT0lOVF9IT1NUfToke0VORFBPSU5UX1BPUlQ6LTI0MDh9fCIgd3AuY29uZgogIGZpCiAgcHJpbnRmICdcbltTb2NrczVdXG5CaW5kQWRkcmVzcyA9IDEyNy4wLjAuMTolc1xuJyAiJEJJTkRfUE9SVCIgPj4gd3AuY29uZgogIC4vd2lyZXByb3h5IC1jIHdwLmNvbmYgPndpcmVwcm94eS5sb2cgMj4mMSAmCgogIGZvciBfIGluICQoc2VxIDEgMzApOyBkbwogICAgY3VybCAtcyAtLW1heC10aW1lIDUgLS1zb2NrczUtaG9zdG5hbWUgIjEyNy4wLjAuMTokQklORF9QT1JUIiBcCiAgICAgIGh0dHBzOi8vd3d3LmNsb3VkZmxhcmUuY29tL2Nkbi1jZ2kvdHJhY2UgPi9kZXYvbnVsbCAyPiYxICYmIGJyZWFrCiAgICBzbGVlcCAyCiAgZG9uZQoKICB0cmFjZT0kKGN1cmwgLXMgLS1tYXgtdGltZSAyMCAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgIGh0dHBzOi8vd3d3LmNsb3VkZmxhcmUuY29tL2Nkbi1jZ2kvdHJhY2UgfHwgdHJ1ZSkKICBleGl0X2lwPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmlwPS8vcCcpCiAgY29sbz0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL15jb2xvPS8vcCcpCiAgd2FycD0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL153YXJwPS8vcCcpCiAgbG9jPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmxvYz0vL3AnKQogICMgV0FSUCBpcyBkdWFsIHN0YWNrIGFuZCBjZG4tY2dpL3RyYWNlIHJlcG9ydHMgd2hpY2hldmVyIGZhbWlseSB0aGUgcmVxdWVzdAogICMgdXNlZCDigJQgb3ZlciBXQVJQIHRoYXQgaXMgSVB2Ni4gQm90aCBoYXZlIHRvIGJlIGNhcHR1cmVkOiB0aGUgdjQgYWRkcmVzcyBpcwogICMgd2hhdCBlYXJsaWVyIGNvbGxpc2lvbnMgd2VyZSByZWNvcmRlZCBhcywgYW5kIGVpdGhlciBmYW1pbHkgY2FuIGJlIHRoZSBvbmUKICAjIGEgcGVlciBsYW5lIGhhcyBhbHJlYWR5IGNsYWltZWQuCiAgZXhpdF92ND0kKGN1cmwgLTQgLXMgLS1tYXgtdGltZSAxNSAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgIGh0dHBzOi8vYXBpLmlwaWZ5Lm9yZyB8fCB0cnVlKQogIGVjaG8gInJvbGw9JHJvbGwgZXhpdF9pcD0ke2V4aXRfaXA6LUZBSUxFRH0gZXhpdF92ND0ke2V4aXRfdjQ6LW5vbmV9IGNvbG89JHtjb2xvOi11bmtub3dufSB3YXJwPSR7d2FycDotdW5rbm93bn0iCgogIGlmIFtbIC16ICIkZXhpdF9pcCIgfHwgIiR3YXJwIiAhPSAib24iIF1dOyB0aGVuCiAgICBlY2hvICIgIHR1bm5lbCBkaWQgbm90IGNvbWUgdXAgb24gcm9sbCAkcm9sbCIgPiYyCiAgICBjb250aW51ZQogIGZpCiAgaWYgaXNfZm9yYmlkZGVuICIkZXhpdF9pcCIgfHwgeyBbWyAtbiAiJGV4aXRfdjQiIF1dICYmIGlzX2ZvcmJpZGRlbiAiJGV4aXRfdjQiOyB9OyB0aGVuCiAgICBlY2hvICIgIGV4aXQgJHtleGl0X3Y0Oi0kZXhpdF9pcH0gaXMgaW4gV0FSUF9GT1JCSURfRVhJVFMg4oCUIHJlLXJvbGxpbmciID4mMgogICAgZXhpdF9pcD0iIgogICAgY29udGludWUKICBmaQogIGJyZWFrCmRvbmUKCmVjaG8gImVuZHBvaW50X3VzZWQ9JChncmVwIC1FICdeRW5kcG9pbnQnIHdwLmNvbmYgfCBoZWFkIC0xIHwgc2VkICdzLy4qPSAqLy8nKSIKZWNobyAiZXhpdF9pcD0ke2V4aXRfaXA6LUZBSUxFRH0iCmVjaG8gImV4aXRfdjQ9JHtleGl0X3Y0Oi1ub25lfSIKZWNobyAiY29sbz0ke2NvbG86LXVua25vd259IgplY2hvICJ3YXJwPSR7d2FycDotdW5rbm93bn0iCmVjaG8gImxvYz0ke2xvYzotdW5rbm93bn0iCmVjaG8gInJvbGxzX3VzZWQ9JHJvbGwiCgppZiBbWyAteiAiJGV4aXRfaXAiIHx8ICIkd2FycCIgIT0gIm9uIiBdXTsgdGhlbgogIGVjaG8gIm5vIGFjY2VwdGFibGUgV0FSUCBleGl0IGFmdGVyICRyb2xsIHJvbGxzIChmb3JiaWQ9JyRGT1JCSUQnKSIgPiYyCiAgdGFpbCAtMjAgd2lyZXByb3h5LmxvZyA+JjIgfHwgdHJ1ZQogIGV4aXQgMQpmaQo=' | base64 -d > warp_up.sh
+          chmod +x warp_up.sh
+          # Falling through to the runner's own egress would mint nothing but
+          # 600010 for hours, so a failed tunnel must kill the job.
+          ./warp_up.sh "$SOCKS_PORT" | tee /tmp/warp.txt | sed 's/^/warp_/'
+          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+
+      - name: 4a. Go toolchain (joinverify needs >= the version in its go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: 4. Build the join verifier
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/jv && cd /tmp/jv
+          echo 'H4sIAAAAAAAAA+0Z21LbSDav+Ct6VBViJ0a2AZPgjGeKBQIk4TLYTC5satO22rKCrFa6JRuSoWo/Yr9wv2TPOd2SZQYy2d1KZmtLx1XWpbvP/datCQ8i15f3viU0ATbW1+81N5qtx+0WXZvNFr2Ha3u1vXEP/teaj1urTRxvNddbG/dY85tyZSHVCVeM3Xsp/EBG34Pi/xQ0GuyDDKKpUMHoiikRh/xKM876qYp0EoSCJfJCRCwZK5n6Y+ZzlQTDBxqm8pCWsjGPPD3mF4LBTQUQAhapEs1mY5GMhYK1GZYAUA+TlIfhFdwMRZwIz4UluOogoWGWqGAyER4byviKyRGtjoNYhEEkgO5w4jWQrCcGqV8HWl46hNmJpIkyEohrKCeDIOIJWNRyzIapUiJKcsKaVeN0EMIIYqszEDwZSTVhzToLvEBOOGtt1jKRYj684D7Q0ZIFCRvyiKk0AnLA8PYB3kdC1VFiJYiRgUxIDyhTBPd8yoOQD0KRiftqfMX2JOKn8ZOrZCyjDqAzd2wmBloOL0SyMgwDYLyg5kQiAi0UWO3oyDUCugHR4pGeAQ8emwXJmG2HMvVGIQem1ptrLE6VAAUA9v7LHhsFkS9UrIIoqSPCkZIT4h3QXjHNJ4IdnOQiAW7LiC8StNMwFKCFVrPlsh0VTAEZLTZM5/iCSAeeUck2n8h0JC9Bmb7AgURwMLPieiz0fHTaWmuDnZ+nvh8KZawJ2h2iMV1QGYwh9zHXWmjS31DqhLQ8RibEZaI4++ff/4GGAq5jJZAW+BxoRUaIUJCEe0Gynw5WxrAaRowJM+ucaeCxUwyN85VYycsrkk+3O40Gruugo79jP5J3/4QLT1CdGpgAPydVC4aO22HPjw+OdnfYb+x09/nudh9uh9IT3SN4s3t6enza+REiSsvoJ3jRPzjcPT7rW14s4QlPEqE0m0iyB+ge5AulvNCdeVQWDP5q65n1Bo3qn7vMihfooSQViMiLQcTEeAsnJxmEIKGxEVlQS3AEoyurJETFPU8JtEAdQ8LoCLWPeMnaZiqwJGcREz5OZiOIAfiXihlZkTFOvjLmU5FbEGLZk4alPHW4rAfMZk42HAvgMctJ5HborgnSDBHfPOXMOKgMRETjI29KTOBqKLMpV4EJShvgoOUgqlSCCRqWVStLDjhfAi7l4K26ihPZSEKNTyICAwJDjQ8gCb4Atft0ndDsQOJ/JBJ7aYyTJM7uUxXirYZkF/mELgkmwqnAjQ9ypwMXUljDlyoIQ97IcwFO9GXII9+Vym9cNhAXuYdTqVUqyVUsmBfw8FkaDdkI/qrD5JJZEdxtc60zWDWT6qJOVmSGiRqrwmucA8lQKCUVIERNKnAi1MYzMpuW4ZTCjskYIxKKgI2LWAwhqG0eBvzsIpIDjYnQWGi/3z+haDZZBAMXX+eyEeNgoEhATWB9tGkcgotbv8fU2DveftGz9DDXEToo4OClZrHNwJwYRIJ28gQmMV8uekwCLHDlQcjilDFEEsWINK4Bef346AgiFSkFWqfI1ZlGD+RM8VnGLnozEEPjdrBQELKZTEOqGxoqKBUdyD8XlLesgqwQiRbhyK2gqRY0XSV15pbJbFo3Rn2I1NxT8TEVOoHhh+BO7tnpy8xw2ZV9riwNuBas02XLaN0d4vlzH3xNpkmHtdrsIUPPc3sCvMS7riwFI2PKbpc5DiJYUiKBZoAhIkIwd6MgpL/KEqyLudLCI8pIDjk6wVckSY3w4tAPXVxRxJthoaWEClkwgeHuc32ixCi4rBr8bg9CfyLqzKE87JCISxDGjKfgZw9Jre4W3MNrwGNXnUHmK5JewuoBIQD8/g25LUwDrs1QtYYTCS1ob474M87qLCzBvwgSUBU0ny3vsIwGSIRSLRHHuYIMQvLodtVJhrFTz3DuQ2Wpk0B10nrNyHJDfXfoj0jZof86AywQIv7JA6oLy5G96xvecKfPkOdSxIG/WqPWzLrrSgX4hEBNQZ1bPiYJ8MFD+YlyYNttsuor6PvkTLOjPjQebvMpgxcb60/Z5cZ6jW3FcSheicGLIGm01x67axvMYY8gY1Zf7PcPITjCAJqnPagcssa2IRNMRKO11nKb+GM9PoJiYBdCIqaQhCJWpTJSN/bqFaPSXFFFGJ52xj6kkdzGCxGdI/hSMDimF6C5HeAep7m7aAt0R1BsjpJimrTZz14hHkgx25RgQeOjwO+wZShXrnn4fBBpAX2w6F0E8a9UsjvAYyqu67CyYKYOQyCpYICsZV4ZmAtKLNmEnvNj6M+TzGpzMcnUWc5xZ64isD4ogTKaDUpCdiRmNs9Vnb3dPgSJg+815Nq8722YvqbxM7UF3dbydA3+sEp2W5sOOVctR+7uQ9cJMdsTgBEDd4VcDablbnfH5GMV+EF0KwfOHUtOxQjKkbqda7MIhAer5C5jlOnuyKrF9xXekvVztzoMlCqrz0BCyeDeVhhWM7LuX6R3VWCDnsGAEvI2vB7AE640nl4FVIabH7L0jP4CDZOu4kwQ8udhF1Lyb7/dPSNTg83cUCL7phYnqWnmOSOqOgrimJoC2IVGfhroMXPsVg4KAtjKM5uSgxPH4KFm1cHamne1Q+iSadM25rFwsDkIhmPqmWGLB2oOhtC+SNyjzgIQHnO0JZsLrd1DHlcpkSpMB6JG/yYxgioUFsoHf40eoNT2QRUfkgdmbmazB+wBPl4XEqsyCXRgbIFYoWmoWlZq7CfWghAiJBl73Uw/5x0Ye3cj608St0fbulHVekgkV0yMdIymu/e9DpLr3v/o4B7aWr9Hg9uwL6lnBIwTmcVFrfSwN6suPv3OxOetd/Dswg3yiPudIoo+bPR70HeL29GQLwEGaEOpwA/BbIGAngK2V+fvzJLKErZff6tTQwaoFdp7Lo8NxV95CJFUdSAkV7YJi/W+mAe3CEUR4zy1XJsuIqDwg4ZoeXnu29Cc9NKRaU4C6D2drsW7VOS1yzgoMvKqhZd1QlkzdsPMB+0SMrJguplGLd7XbiHRUaeMd6Cd+3p59+C4u7ac59DufKNQt5u9Om0zgdKYdJHnVaOaz9fZwB/kw/HX58Hxv5P/rK8XVIP+bry9iMiarZ6b6jkE+KJGnafMqdWMOm1vDsLmGsl639tq5NcXyf3sEObOFhpnHYnkRjW9s5beLKaG2TotOL1ZHIxYpgUDj4FuilR0a4mwKRVWNY0TFzEu9JF2ZndhRiEX/GF2mekVXFrILfenZCp8JOZNFvHQG+wBUV5kKkt0iHjD+d+vr5636p+dqdNZxUPiukNtmNNx7mun7kTB8ALuQXcDcAqHT3nCldOBadkxHj2Yczyn09q8fve+bg4EgBUoFseQwj1QHp7N0BaOtqJjGUL1uDRlw2WnYoWridnx6TH2XPkSPBZcMkdTUJ5SnAPtfmL2vsY1cN84UxJG6CTD7uVxG6vw3CubNeHqQhMuOtjIj7pYLNSER2b3iAcnuLnSZvMIpsATuhjqKh1BRnSaxqHiUdtO2FJgLKTZYTBQHObHHNSmXbSDlQJbVPTcIzmr1twtz6uu3vDmWuaRGIbYPezYtdUMSc0YsGdbwBEPtTBpGZ0LUvNEaDxMy53Y4kNkh2aoescGp7APzNuIQnsDIW+VmKXdvC+yB2jOzUo7d9ghup/3+46JpmPUFvoeK4HlkgZxd7zq2PgxAr1SQSIyieZppw/TDzMVnL8bXCWi6qxRpsI6Qe6ThVgR+3rTFJtcuUQrf+pSTvrPyCOSu+jP6RW7uPk23OzinPXVealbQIGVeqTwMO78HR6Muad8ZukbAvTyLAK3hzwaVi1LiPZ8tfMOjLpMy2uZJwAbWCHsS9BM81a6YmodsNhd2MbCLIZqDtjfO+8zb6MVqOq2s7DPdcxRrTNXynzqRj4Vzy+RnhOlYehYdy1wCl1b7pQ0N3cnww02Nje9c/FoGH3TrM37hGu7L8VTyioZYL4txeALuQ+Jm6g45lgQbOVkpyULp9Z4EKWFPYRbPE+F2B7xNITC5QUKslENKzXhNic6pt7Qi6Mt5QMjP1phMYXTCXgYFVpPyruQSv10gp1FLS8mVBWKa3C/TXgRbRPM9XC+a66B9H/217L/P/ClO5Het6Xx5e+/+AV4Pfv+C5cmfv9dXW+W33+/B4DxU2h65h+6KhVfspa72nablQqeQUAKYF/6JsGmLbftrhUm3/hAwaZNt/0Y0P3Zspbwe4D41+nk29L4o/hvt5rz+G+tUvxvrJbx/z3gKyKbjVsdzXeStxsng8tGM3008N/8svZxcyN+629/Go1fvN47+Zg8vnj7eJUfHfndylfgbJi6g6jfnD4J20+aEbSBv0y3Dvr+6vjt5utfx+uDdvvR7lmDe1sfRq3R4f54F1DfkVsQ0Yv2o7Wd8MP0IN3Z22w8n26q6dXh1ezN0bPtXzZPe2dvNo6P+/2L/qPkC4gKjL2IXw+fBNNHau11HL7c2muMHj/Xo83TE/3p+SfvtDlqP/m4Od07TnfPumVuK6GEEkoooYQSSiihhBJKKKGEEkoooYQSSiihhBJKKKGEEkoooYQSSiihhBJKKKGEEkoo4bvAvwClZ6YHAFAAAA==' | base64 -d | tar xzf -
+          go build -o /tmp/joinverify .
+          # A verifier that cannot answer REJECTED for an obviously bogus token
+          # is measuring itself, not gartic.
+          /tmp/joinverify -proxy "socks5://127.0.0.1:$SOCKS_PORT" '1.AAAAAAAAAAAA.BBBBBBBB' \
+            | sed 's/^/selftest(bogus token, expect REJECTED code=5): /'
+
+      - name: 5. Write the MV3 extension
+        env:
+          LANES: ${{ github.event.inputs.lanes }}
+          PER_MIN: ${{ github.event.inputs.per_min }}
+          POST_TO_RELAY: ${{ github.event.inputs.post_to_relay }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ext
+          cat > /tmp/ext/manifest.json <<'MANIFEST'
+          {
+            "manifest_version": 3,
+            "name": "gartic token producer",
+            "version": "1.0",
+            "host_permissions": ["https://gartic.io/*", "https://mohanadino.duckdns.org/*"],
+            "content_scripts": [{
+              "matches": ["https://gartic.io/*"],
+              "js": ["producer.js"],
+              "run_at": "document_idle",
+              "world": "MAIN"
+            }]
+          }
+          MANIFEST
+
+          # Runner variant of tunnel system/vm-chromium-producer/producer.js.
+          # Only difference: it emits the FULL token on a `TOKFULL` line so the
+          # job can verify acceptance. That line goes to the Chrome log file,
+          # which is never printed or uploaded -- the repo is public.
+          cat > /tmp/ext/producer.js <<'PRODUCER'
+          (function () {
+            'use strict';
+            var RELAY  = '__RELAY__';
+            var SECRET = '__SECRET__';
+            var KEY    = '__SITEKEY__';
+            var LANES  = __LANES__;
+            var PER_MIN = __PER_MIN__;
+            var POST = __POST__;
+            var GAP = Math.round(60000 / PER_MIN);
+            var nextAllowed = 0, minted = 0, posted = 0;
+
+            function log(){ console.log.apply(console, ['[producer]'].concat([].slice.call(arguments))); }
+
+            function post(tok) {
+              if (!POST) { posted++; return; }
+              fetch(RELAY, { method:'POST',
+                headers:{'Content-Type':'application/json','X-Auth':SECRET},
+                body: JSON.stringify({token: tok})
+              }).then(function(r){ if(r.ok){posted++;} log('posted', r.status, 'minted='+minted, 'posted='+posted); })
+                .catch(function(e){ log('relay error', e && e.message); });
+            }
+
+            function lane(i) {
+              var slot, id;
+              function build() {
+                slot = document.createElement('div');
+                slot.id = 'prod_' + i;
+                slot.style.cssText = 'position:fixed;left:' + (10 + i*180) + 'px;bottom:10px;z-index:2147483647';
+                document.body.appendChild(slot);
+                try {
+                  id = window.turnstile.render(slot, {
+                    sitekey: KEY, action: 'join', appearance: 'interaction-only',
+                    callback: function(){},
+                    'error-callback': function(c){ log('cf err', c); setTimeout(recycle, 2000); },
+                    'before-interactive-callback': function(){ log('BEFORE_INTERACTIVE (lane '+i+')'); },
+                    'after-interactive-callback': function(){ log('AFTER_INTERACTIVE (lane '+i+')'); },
+                    'timeout-callback': function(){ recycle(); }
+                  });
+                } catch (e) { log('render threw', e && e.message); setTimeout(recycle, 3000); return; }
+                poll(0);
+              }
+              function read() {
+                try { var t = window.turnstile.getResponse(id); if (t) return t; } catch(e){}
+                var el = slot && slot.querySelector('input[name="cf-turnstile-response"]');
+                return el && el.value ? el.value : null;
+              }
+              function poll(n) {
+                var t = read();
+                if (t) {
+                  var now = Date.now();
+                  var wait = Math.max(0, nextAllowed - now);
+                  nextAllowed = Math.max(now, nextAllowed) + GAP;
+                  minted++;
+                  log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16));
+                  log('TOKFULL ' + t);
+                  setTimeout(function(){ post(t); }, wait);
+                  setTimeout(recycle, wait + 500);
+                  return;
+                }
+                if (n > 60) { recycle(); return; }
+                setTimeout(function(){ poll(n+1); }, 1000);
+              }
+              function recycle() {
+                try { window.turnstile.remove(id); } catch(e){}
+                if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
+                setTimeout(build, 300);
+              }
+              return build;
+            }
+
+            setInterval(function(){
+              var ifr = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length;
+              var boxes = document.querySelectorAll('[id^="prod_"]').length;
+              log('DIAG iframes=' + ifr + ' lanes=' + boxes + ' minted=' + minted + ' posted=' + posted);
+            }, 20000);
+
+            var waited = 0;
+            (function wait() {
+              if (window.turnstile && window.turnstile.render) {
+                log('turnstile present -- starting', LANES, 'lanes');
+                for (var i = 0; i < LANES; i++) setTimeout(lane(i), i * 800);
+                return;
+              }
+              if ((waited += 250) > 60000) { log('window.turnstile NEVER appeared'); return; }
+              setTimeout(wait, 250);
+            })();
+          })();
+          PRODUCER
+
+          if [ "$POST_TO_RELAY" = "true" ]; then POSTJS=true; else POSTJS=false; fi
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|" /tmp/ext/producer.js
+          grep -c . /tmp/ext/producer.js
+
+      - name: 6. Mint
+        timeout-minutes: 350
+        continue-on-error: true
+        env:
+          MINUTES: ${{ github.event.inputs.minutes }}
+        run: |
+          set -uo pipefail
+          export DISPLAY=:97
+          Xvfb :97 -screen 0 1280x900x24 -ac -nolisten tcp >/dev/null 2>&1 &
+          sleep 3
+
+          LOG=/tmp/chrome.log
+          : > "$LOG"
+          # Plain browser, no automation protocol. --proxy-server sends every
+          # request (including the relay POST) through WARP; Chromium resolves
+          # DNS remotely for socks5://, so nothing leaks to the runner resolver.
+          # DisableLoadExtensionCommandLineSwitch: Chrome >=137 ignores
+          # --load-extension without it.
+          google-chrome \
+            --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
+            --disable-dev-shm-usage \
+            --user-data-dir=/tmp/chrome-profile \
+            --proxy-server="socks5://127.0.0.1:$SOCKS_PORT" \
+            --disable-features=DisableLoadExtensionCommandLineSwitch \
+            --disable-extensions-except=/tmp/ext \
+            --load-extension=/tmp/ext \
+            --enable-logging=stderr --v=0 \
+            "https://gartic.io/" >> "$LOG" 2>&1 &
+          CHROME_PID=$!
+
+          # Fail fast and loudly if the extension never ran at all -- that is a
+          # different bug from "the challenge did not solve", and conflating the
+          # two is what cost the previous session its diagnosis.
+          for _ in $(seq 1 24); do
+            grep -aq '\[producer\]' "$LOG" && break
+            sleep 5
+          done
+          if ! grep -aq '\[producer\]' "$LOG"; then
+            echo "::error::extension never executed -- --load-extension was ignored or the page never loaded"
+            grep -aiE 'extension|ERROR' "$LOG" | tail -20
+            exit 1
+          fi
+          echo "extension is running"
+
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          verified=0; accepted=0; lastcheck=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 30
+            kill -0 "$CHROME_PID" 2>/dev/null || { echo "chrome exited"; break; }
+
+            # grep -c always prints a number but exits 1 on no match, so a
+            # `|| echo 0` fallback would capture "0\n0" and break the arithmetic.
+            MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null); MINTED=${MINTED:-0}
+            POSTED=$(grep -ao 'posted=[0-9]*' "$LOG" 2>/dev/null | tail -1); POSTED=${POSTED:-posted=0}
+            NOW=$(date +%s)
+            echo "[summary] t=$(( NOW - (END - MINUTES*60) ))s minted=$MINTED $POSTED accepted=$accepted/$verified exit=${EXITIP:-unknown}"
+
+            # Verify one fresh token every ~3 min. Tokens are single-use, so a
+            # verified one is spent -- keep this sparse. Never print the token.
+            if [ $(( NOW - lastcheck )) -ge 180 ] && [ "$MINTED" -gt 0 ]; then
+              lastcheck=$NOW
+              TOK=$(grep -a 'TOKFULL ' "$LOG" | tail -1 | sed 's/.*TOKFULL //' | tr -d '\r' | tr -d '"')
+              if [ -n "$TOK" ]; then
+                V=$(/tmp/joinverify -proxy "socks5://127.0.0.1:$SOCKS_PORT" "$TOK" 2>&1 | tail -1)
+                verified=$(( verified + 1 ))
+                case "$V" in JOINED*) accepted=$(( accepted + 1 ));; esac
+                echo "[verify] $V   (running $accepted/$verified ACCEPTED)"
+              fi
+            fi
+          done
+
+          MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null); MINTED=${MINTED:-0}
+          echo "=============================================="
+          echo "[result] exit_ip=${EXITIP:-unknown} minted=$MINTED accepted=$accepted/$verified"
+          echo "=============================================="
+          grep -a 'cf err' "$LOG" | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
+          if [ "$MINTED" -eq 0 ]; then
+            echo "::error::minted 0 -- check 'cf err' codes above (600010=ASN/browser refused, 300030=exit collision)"
+          fi
+
+      - name: 7. Dispatch successor
+        if: ${{ always() && github.event.inputs.chain == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.CHAIN_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run gartic-chromium-warp.yml -f chain=true; then
+              echo "successor dispatched on attempt $attempt"; exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          exit 1
