@@ -53,6 +53,18 @@ on:
         description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
         required: false
         default: ""
+      tunnels:
+        # Rate is capped PER EXIT IP (~12-14 tok/min issuance; gartic refuses
+        # everything above ~12/min from one IP), so throughput scales with exit
+        # IPs and nothing else -- not lanes, not per_min. On a runner each fresh
+        # anonymous WARP registration draws a DIFFERENT exit: five runs took
+        # 104.28.216.161/MSP, .227.110/ORD, .201.80/SJC, .221.80, .216.157/DFW.
+        # So N tunnels x 1 Chromium each ~= N x 12 tok/min on one runner.
+        # (The VM's "all WARP namespaces share one exit" note does NOT hold here.)
+        # 4 vCPU is the real ceiling: each instance is a Chromium + an Xvfb.
+        description: "Independent WARP tunnels, each its own exit IP + browser. Throughput scales with this."
+        required: false
+        default: "3"
       browser:
         # cft136 mints ZERO with no `cf err` at all -- the challenge neither
         # errors nor solves, which is not the AS8075 signature (that is loud
@@ -133,23 +145,52 @@ jobs:
           echo "CHROME_BIN=/opt/chrome-linux64/chrome" >> "$GITHUB_ENV"
           /opt/chrome-linux64/chrome --version
 
-      - name: 3. Bring up Cloudflare WARP (SOCKS5) -- FATAL if it fails
+      - name: 3. Bring up N Cloudflare WARP tunnels, one exit IP each
         env:
-          WARP_FORBID_EXITS: ${{ github.event.inputs.forbid_exits }}
-          # Registration is flaky on runners: one run burned all 4 default rolls
-          # and reported exit_v4=none, failing a job whose browser was fine.
-          # Rolls are cheap (a fresh anonymous registration), the job is not.
-          WARP_MAX_ROLLS: "10"
+          FORBID: ${{ github.event.inputs.forbid_exits }}
+          TUNNELS: ${{ github.event.inputs.tunnels }}
         run: |
-          set -euo pipefail
+          # NOT `set -e`: one tunnel failing to register must not kill a job that
+          # can still run on the others. Only zero tunnels is fatal -- falling
+          # through to the runner's own AS8075 egress would mint nothing but
+          # 600010 for hours.
+          set -uo pipefail
+          TUNNELS="${TUNNELS:-3}"
           mkdir -p /tmp/warp && cd /tmp/warp
-          echo 'IyEvdXNyL2Jpbi9lbnYgYmFzaAojIEJyaW5nIHVwIENsb3VkZmxhcmUgV0FSUCBhcyBhIGxvY2FsIFNPQ0tTNSBsaXN0ZW5lciwgcmVwb3J0IHRoZSBleGl0LCBhbmQKIyByZWZ1c2UgdG8gaGFuZCBiYWNrIGEgdHVubmVsIHdob3NlIGV4aXQgY29sbGlkZXMgd2l0aCBvbmUgYWxyZWFkeSBpbiB1c2UuCiMKIyBTaGFyZWQgYnkgdGhlIGV4aXQtY2hhcmFjdGVyaXNhdGlvbiBwcm9iZSBhbmQgdGhlIHByb2R1Y3Rpb24gcHJvZHVjZXJzLCBzbyBhbGwKIyBvZiB0aGVtIGFyZSBndWFyYW50ZWVkIHRvIG1lYXN1cmUgdGhlIHNhbWUgdGhpbmcuCiMKIyBVc2FnZTogd2FycF91cC5zaCA8YmluZF9wb3J0PiBbZW5kcG9pbnRfaG9zdF0gW2VuZHBvaW50X3BvcnRdCiMKIyBFbnZpcm9ubWVudDoKIyAgIFdBUlBfRk9SQklEX0VYSVRTICBjb21tYS1zZXBhcmF0ZWQgZXhpdCBJUHMgb3IgSVAgcHJlZml4ZXMgdG8gcmVqZWN0LCBlLmcuCiMgICAgICAgICAgICAgICAgICAgICAgIjEwNC4yOC4xOTYuNzksMTA0LjI4LjIyMS4iIEEgcHJlZml4IGVuZGluZyBpbiAnLicKIyAgICAgICAgICAgICAgICAgICAgICBtYXRjaGVzIGJ5IHByZWZpeC4gT24gYSBtYXRjaCB0aGUgdHVubmVsIGlzIHRvcm4gZG93biBhbmQKIyAgICAgICAgICAgICAgICAgICAgICBhIEZSRVNIIHJlZ2lzdHJhdGlvbiBpcyBhdHRlbXB0ZWQuCiMgICBXQVJQX01BWF9ST0xMUyAgICAgaG93IG1hbnkgcmVnaXN0cmF0aW9ucyB0byB0cnkgYmVmb3JlIGdpdmluZyB1cCAoZGVmYXVsdCA0KQojCiMgV2h5IHRoZSBmb3JiaWQgbGlzdCBleGlzdHM6IFR1cm5zdGlsZSBzb2x2ZS1yYXRlIGlzIGNhcHBlZCBwZXIgZXhpdCBJUCwgbm90IHBlcgojIG1hY2hpbmUuIFR3byBwcm9kdWNlcnMgYmVoaW5kIG9uZSBleGl0IGlzIG1lYXN1cmFibHkgZmF0YWwg4oCUIG9uZSBzdXN0YWlucyB+NDkKIyB0b2svbWluIHdoaWxlIHRoZSBvdGhlciBnZXRzIG5vdGhpbmcgYnV0IENsb3VkZmxhcmUgMzAwMDMwLiBUd28gcnVubmVycyBkcmF3aW5nCiMgdGhlIHNhbWUgYW55Y2FzdCBleGl0IGlzIG5vdCBoeXBvdGhldGljYWw7IGl0IHdhcyBvYnNlcnZlZC4gU28gYW55IHNlY29uZAojIHByb2R1Y2VyLCBpbiB0aGlzIGxhbmUgb3IgYW5vdGhlciAodGhlIE9yYWNsZSBWTSBsYW5lIGFsc28gdXNlcyBXQVJQKSwgbXVzdCBiZQojIHRvbGQgd2hpY2ggZXhpdHMgYXJlIHRha2VuIGFuZCBkZWNsaW5lIHRoZW0uCiMKIyBQcmludHMgYGtleT12YWx1ZWAgbGluZXMgYW5kIGxlYXZlcyB3aXJlcHJveHkgcnVubmluZyBpbiB0aGUgYmFja2dyb3VuZC4gRXhpdHMKIyBub24temVybyBpZiBubyBhY2NlcHRhYmxlIHR1bm5lbCBjb3VsZCBiZSBlc3RhYmxpc2hlZCDigJQgY2FsbGVycyBNVVNUIHRyZWF0CiMgdGhhdCBhcyBmYXRhbCwgYmVjYXVzZSBmYWxsaW5nIHRocm91Z2ggdG8gdGhlIHJ1bm5lcidzIG93biBlZ3Jlc3MgbWVhbnMgbWludGluZwojIGZyb20gQVM4MDc1LCB3aGljaCB5aWVsZHMgbm90aGluZyBidXQgQ2xvdWRmbGFyZSA2MDAwMTAuCnNldCAtZXVvIHBpcGVmYWlsCgpCSU5EX1BPUlQ9IiR7MTo/YmluZCBwb3J0IHJlcXVpcmVkfSIKRU5EUE9JTlRfSE9TVD0iJHsyOi19IgpFTkRQT0lOVF9QT1JUPSIkezM6LX0iCkZPUkJJRD0iJHtXQVJQX0ZPUkJJRF9FWElUUzotfSIKTUFYX1JPTExTPSIke1dBUlBfTUFYX1JPTExTOi00fSIKCiMgVGhlIHJlbGVhc2UgQ0ROIDUwNHMgaW4gYnVyc3RzIHRoYXQgb3V0bGFzdCBhbnkgY3VybCAtLXJldHJ5IGJ1ZGdldC4KZGwoKSB7CiAgZm9yIGF0dGVtcHQgaW4gMSAyIDMgNCA1IDY7IGRvCiAgICBjdXJsIC1mc1NMIC0tcmV0cnkgMyAtLXJldHJ5LWRlbGF5IDMgLS1yZXRyeS1hbGwtZXJyb3JzIFwKICAgICAgLS1jb25uZWN0LXRpbWVvdXQgMjAgLW8gIiQyIiAiJDEiICYmIHJldHVybiAwCiAgICBlY2hvICJkb3dubG9hZCBhdHRlbXB0ICRhdHRlbXB0IGZvciAkMiBmYWlsZWQ7IGJhY2tpbmcgb2ZmIiA+JjIKICAgIHNsZWVwICQoKCBhdHRlbXB0ICogOCApKQogIGRvbmUKICByZXR1cm4gMQp9CgppZiBbWyAhIC14IC4vd2djZiBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9WaVJiMy93Z2NmL3JlbGVhc2VzL2Rvd25sb2FkL3YyLjIuMzIvd2djZl8yLjIuMzJfbGludXhfYW1kNjQgd2djZgogIGNobW9kICt4IHdnY2YKZmkKaWYgW1sgISAteCAuL3dpcmVwcm94eSBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9wdWZmZXJmZmlzaC93aXJlcHJveHkvcmVsZWFzZXMvZG93bmxvYWQvdjEuMS4zL3dpcmVwcm94eV9saW51eF9hbWQ2NC50YXIuZ3ogd2lyZXByb3h5LnRhci5negogIHRhciB4emYgd2lyZXByb3h5LnRhci5negpmaQoKIyBEb2VzICQxIG1hdGNoIGFueSBlbnRyeSBpbiB0aGUgY29tbWEtc2VwYXJhdGVkICRGT1JCSUQgbGlzdD8gQW4gZW50cnkgZW5kaW5nCiMgaW4gJy4nIGlzIHRyZWF0ZWQgYXMgYSBwcmVmaXggc28gYSB3aG9sZSAvMjQtaXNoIGJsb2NrIGNhbiBiZSByZXNlcnZlZC4KaXNfZm9yYmlkZGVuKCkgewogIGxvY2FsIGlwPSIkMSIgZW50cnkKICBbWyAteiAiJEZPUkJJRCIgXV0gJiYgcmV0dXJuIDEKICBsb2NhbCBJRlM9JywnCiAgZm9yIGVudHJ5IGluICRGT1JCSUQ7IGRvCiAgICBlbnRyeT0iJHtlbnRyeS8vIC99IgogICAgW1sgLXogIiRlbnRyeSIgXV0gJiYgY29udGludWUKICAgIGlmIFtbICIkZW50cnkiID09ICouIF1dOyB0aGVuCiAgICAgIFtbICIkaXAiID09ICIkZW50cnkiKiBdXSAmJiByZXR1cm4gMAogICAgZWxzZQogICAgICBbWyAiJGlwIiA9PSAiJGVudHJ5IiBdXSAmJiByZXR1cm4gMAogICAgZmkKICBkb25lCiAgcmV0dXJuIDEKfQoKZXhpdF9pcD0iIjsgY29sbz0iIjsgd2FycD0iIjsgbG9jPSIiOyByb2xsPTAKd2hpbGUgKCggcm9sbCA8IE1BWF9ST0xMUyApKTsgZG8KICByb2xsPSQoKCByb2xsICsgMSApKQogIHBraWxsIC1mICd3aXJlcHJveHkgLWMnIDI+L2Rldi9udWxsIHx8IHRydWUKICBzbGVlcCAxCgogICMgQSBmcmVzaCBhbm9ueW1vdXMgcmVnaXN0cmF0aW9uIGVhY2ggcm9sbDogbm8gc2lnbnVwLCBubyBjcmVkZW50aWFscy4gRGVsZXRpbmcKICAjIHRoZSBhY2NvdW50IGZpbGUgaXMgd2hhdCBtYWtlcyBpdCBmcmVzaCByYXRoZXIgdGhhbiByZXVzZWQuCiAgcm0gLWYgd2djZi1hY2NvdW50LnRvbWwgd2djZi1wcm9maWxlLmNvbmYKICAuL3dnY2YgcmVnaXN0ZXIgLS1hY2NlcHQtdG9zID4vZGV2L251bGwKICAuL3dnY2YgZ2VuZXJhdGUgPi9kZXYvbnVsbAoKICBjcCB3Z2NmLXByb2ZpbGUuY29uZiB3cC5jb25mCiAgaWYgW1sgLW4gIiRFTkRQT0lOVF9IT1NUIiBdXTsgdGhlbgogICAgc2VkIC1pICJzfF5FbmRwb2ludCAqPS4qfEVuZHBvaW50ID0gJHtFTkRQT0lOVF9IT1NUfToke0VORFBPSU5UX1BPUlQ6LTI0MDh9fCIgd3AuY29uZgogIGZpCiAgcHJpbnRmICdcbltTb2NrczVdXG5CaW5kQWRkcmVzcyA9IDEyNy4wLjAuMTolc1xuJyAiJEJJTkRfUE9SVCIgPj4gd3AuY29uZgogIC4vd2lyZXByb3h5IC1jIHdwLmNvbmYgPndpcmVwcm94eS5sb2cgMj4mMSAmCgogIGZvciBfIGluICQoc2VxIDEgMzApOyBkbwogICAgY3VybCAtcyAtLW1heC10aW1lIDUgLS1zb2NrczUtaG9zdG5hbWUgIjEyNy4wLjAuMTokQklORF9QT1JUIiBcCiAgICAgIGh0dHBzOi8vd3d3LmNsb3VkZmxhcmUuY29tL2Nkbi1jZ2kvdHJhY2UgPi9kZXYvbnVsbCAyPiYxICYmIGJyZWFrCiAgICBzbGVlcCAyCiAgZG9uZQoKICB0cmFjZT0kKGN1cmwgLXMgLS1tYXgtdGltZSAyMCAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgIGh0dHBzOi8vd3d3LmNsb3VkZmxhcmUuY29tL2Nkbi1jZ2kvdHJhY2UgfHwgdHJ1ZSkKICBleGl0X2lwPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmlwPS8vcCcpCiAgY29sbz0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL15jb2xvPS8vcCcpCiAgd2FycD0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL153YXJwPS8vcCcpCiAgbG9jPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmxvYz0vL3AnKQogICMgV0FSUCBpcyBkdWFsIHN0YWNrIGFuZCBjZG4tY2dpL3RyYWNlIHJlcG9ydHMgd2hpY2hldmVyIGZhbWlseSB0aGUgcmVxdWVzdAogICMgdXNlZCDigJQgb3ZlciBXQVJQIHRoYXQgaXMgSVB2Ni4gQm90aCBoYXZlIHRvIGJlIGNhcHR1cmVkOiB0aGUgdjQgYWRkcmVzcyBpcwogICMgd2hhdCBlYXJsaWVyIGNvbGxpc2lvbnMgd2VyZSByZWNvcmRlZCBhcywgYW5kIGVpdGhlciBmYW1pbHkgY2FuIGJlIHRoZSBvbmUKICAjIGEgcGVlciBsYW5lIGhhcyBhbHJlYWR5IGNsYWltZWQuCiAgZXhpdF92ND0kKGN1cmwgLTQgLXMgLS1tYXgtdGltZSAxNSAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgIGh0dHBzOi8vYXBpLmlwaWZ5Lm9yZyB8fCB0cnVlKQogIGVjaG8gInJvbGw9JHJvbGwgZXhpdF9pcD0ke2V4aXRfaXA6LUZBSUxFRH0gZXhpdF92ND0ke2V4aXRfdjQ6LW5vbmV9IGNvbG89JHtjb2xvOi11bmtub3dufSB3YXJwPSR7d2FycDotdW5rbm93bn0iCgogIGlmIFtbIC16ICIkZXhpdF9pcCIgfHwgIiR3YXJwIiAhPSAib24iIF1dOyB0aGVuCiAgICBlY2hvICIgIHR1bm5lbCBkaWQgbm90IGNvbWUgdXAgb24gcm9sbCAkcm9sbCIgPiYyCiAgICBjb250aW51ZQogIGZpCiAgaWYgaXNfZm9yYmlkZGVuICIkZXhpdF9pcCIgfHwgeyBbWyAtbiAiJGV4aXRfdjQiIF1dICYmIGlzX2ZvcmJpZGRlbiAiJGV4aXRfdjQiOyB9OyB0aGVuCiAgICBlY2hvICIgIGV4aXQgJHtleGl0X3Y0Oi0kZXhpdF9pcH0gaXMgaW4gV0FSUF9GT1JCSURfRVhJVFMg4oCUIHJlLXJvbGxpbmciID4mMgogICAgZXhpdF9pcD0iIgogICAgY29udGludWUKICBmaQogIGJyZWFrCmRvbmUKCmVjaG8gImVuZHBvaW50X3VzZWQ9JChncmVwIC1FICdeRW5kcG9pbnQnIHdwLmNvbmYgfCBoZWFkIC0xIHwgc2VkICdzLy4qPSAqLy8nKSIKZWNobyAiZXhpdF9pcD0ke2V4aXRfaXA6LUZBSUxFRH0iCmVjaG8gImV4aXRfdjQ9JHtleGl0X3Y0Oi1ub25lfSIKZWNobyAiY29sbz0ke2NvbG86LXVua25vd259IgplY2hvICJ3YXJwPSR7d2FycDotdW5rbm93bn0iCmVjaG8gImxvYz0ke2xvYzotdW5rbm93bn0iCmVjaG8gInJvbGxzX3VzZWQ9JHJvbGwiCgppZiBbWyAteiAiJGV4aXRfaXAiIHx8ICIkd2FycCIgIT0gIm9uIiBdXTsgdGhlbgogIGVjaG8gIm5vIGFjY2VwdGFibGUgV0FSUCBleGl0IGFmdGVyICRyb2xsIHJvbGxzIChmb3JiaWQ9JyRGT1JCSUQnKSIgPiYyCiAgdGFpbCAtMjAgd2lyZXByb3h5LmxvZyA+JjIgfHwgdHJ1ZQogIGV4aXQgMQpmaQo=' | base64 -d > warp_up.sh
+          echo 'IyEvdXNyL2Jpbi9lbnYgYmFzaAojIEJyaW5nIHVwIENsb3VkZmxhcmUgV0FSUCBhcyBhIGxvY2FsIFNPQ0tTNSBsaXN0ZW5lciwgcmVwb3J0IHRoZSBleGl0LCBhbmQKIyByZWZ1c2UgdG8gaGFuZCBiYWNrIGEgdHVubmVsIHdob3NlIGV4aXQgY29sbGlkZXMgd2l0aCBvbmUgYWxyZWFkeSBpbiB1c2UuCiMKIyBTaGFyZWQgYnkgdGhlIGV4aXQtY2hhcmFjdGVyaXNhdGlvbiBwcm9iZSBhbmQgdGhlIHByb2R1Y3Rpb24gcHJvZHVjZXJzLCBzbyBhbGwKIyBvZiB0aGVtIGFyZSBndWFyYW50ZWVkIHRvIG1lYXN1cmUgdGhlIHNhbWUgdGhpbmcuCiMKIyBVc2FnZTogd2FycF91cC5zaCA8YmluZF9wb3J0PiBbZW5kcG9pbnRfaG9zdF0gW2VuZHBvaW50X3BvcnRdCiMKIyBFbnZpcm9ubWVudDoKIyAgIFdBUlBfRk9SQklEX0VYSVRTICBjb21tYS1zZXBhcmF0ZWQgZXhpdCBJUHMgb3IgSVAgcHJlZml4ZXMgdG8gcmVqZWN0LCBlLmcuCiMgICAgICAgICAgICAgICAgICAgICAgIjEwNC4yOC4xOTYuNzksMTA0LjI4LjIyMS4iIEEgcHJlZml4IGVuZGluZyBpbiAnLicKIyAgICAgICAgICAgICAgICAgICAgICBtYXRjaGVzIGJ5IHByZWZpeC4gT24gYSBtYXRjaCB0aGUgdHVubmVsIGlzIHRvcm4gZG93biBhbmQKIyAgICAgICAgICAgICAgICAgICAgICBhIEZSRVNIIHJlZ2lzdHJhdGlvbiBpcyBhdHRlbXB0ZWQuCiMgICBXQVJQX01BWF9ST0xMUyAgICAgaG93IG1hbnkgcmVnaXN0cmF0aW9ucyB0byB0cnkgYmVmb3JlIGdpdmluZyB1cCAoZGVmYXVsdCA0KQojCiMgV2h5IHRoZSBmb3JiaWQgbGlzdCBleGlzdHM6IFR1cm5zdGlsZSBzb2x2ZS1yYXRlIGlzIGNhcHBlZCBwZXIgZXhpdCBJUCwgbm90IHBlcgojIG1hY2hpbmUuIFR3byBwcm9kdWNlcnMgYmVoaW5kIG9uZSBleGl0IGlzIG1lYXN1cmFibHkgZmF0YWwg4oCUIG9uZSBzdXN0YWlucyB+NDkKIyB0b2svbWluIHdoaWxlIHRoZSBvdGhlciBnZXRzIG5vdGhpbmcgYnV0IENsb3VkZmxhcmUgMzAwMDMwLiBUd28gcnVubmVycyBkcmF3aW5nCiMgdGhlIHNhbWUgYW55Y2FzdCBleGl0IGlzIG5vdCBoeXBvdGhldGljYWw7IGl0IHdhcyBvYnNlcnZlZC4gU28gYW55IHNlY29uZAojIHByb2R1Y2VyLCBpbiB0aGlzIGxhbmUgb3IgYW5vdGhlciAodGhlIE9yYWNsZSBWTSBsYW5lIGFsc28gdXNlcyBXQVJQKSwgbXVzdCBiZQojIHRvbGQgd2hpY2ggZXhpdHMgYXJlIHRha2VuIGFuZCBkZWNsaW5lIHRoZW0uCiMKIyBQcmludHMgYGtleT12YWx1ZWAgbGluZXMgYW5kIGxlYXZlcyB3aXJlcHJveHkgcnVubmluZyBpbiB0aGUgYmFja2dyb3VuZC4gRXhpdHMKIyBub24temVybyBpZiBubyBhY2NlcHRhYmxlIHR1bm5lbCBjb3VsZCBiZSBlc3RhYmxpc2hlZCDigJQgY2FsbGVycyBNVVNUIHRyZWF0CiMgdGhhdCBhcyBmYXRhbCwgYmVjYXVzZSBmYWxsaW5nIHRocm91Z2ggdG8gdGhlIHJ1bm5lcidzIG93biBlZ3Jlc3MgbWVhbnMgbWludGluZwojIGZyb20gQVM4MDc1LCB3aGljaCB5aWVsZHMgbm90aGluZyBidXQgQ2xvdWRmbGFyZSA2MDAwMTAuCnNldCAtZXVvIHBpcGVmYWlsCgpCSU5EX1BPUlQ9IiR7MTo/YmluZCBwb3J0IHJlcXVpcmVkfSIKRU5EUE9JTlRfSE9TVD0iJHsyOi19IgpFTkRQT0lOVF9QT1JUPSIkezM6LX0iCkZPUkJJRD0iJHtXQVJQX0ZPUkJJRF9FWElUUzotfSIKTUFYX1JPTExTPSIke1dBUlBfTUFYX1JPTExTOi00fSIKCiMgVGhlIHJlbGVhc2UgQ0ROIDUwNHMgaW4gYnVyc3RzIHRoYXQgb3V0bGFzdCBhbnkgY3VybCAtLXJldHJ5IGJ1ZGdldC4KZGwoKSB7CiAgZm9yIGF0dGVtcHQgaW4gMSAyIDMgNCA1IDY7IGRvCiAgICBjdXJsIC1mc1NMIC0tcmV0cnkgMyAtLXJldHJ5LWRlbGF5IDMgLS1yZXRyeS1hbGwtZXJyb3JzIFwKICAgICAgLS1jb25uZWN0LXRpbWVvdXQgMjAgLW8gIiQyIiAiJDEiICYmIHJldHVybiAwCiAgICBlY2hvICJkb3dubG9hZCBhdHRlbXB0ICRhdHRlbXB0IGZvciAkMiBmYWlsZWQ7IGJhY2tpbmcgb2ZmIiA+JjIKICAgIHNsZWVwICQoKCBhdHRlbXB0ICogOCApKQogIGRvbmUKICByZXR1cm4gMQp9CgppZiBbWyAhIC14IC4vd2djZiBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9WaVJiMy93Z2NmL3JlbGVhc2VzL2Rvd25sb2FkL3YyLjIuMzIvd2djZl8yLjIuMzJfbGludXhfYW1kNjQgd2djZgogIGNobW9kICt4IHdnY2YKZmkKaWYgW1sgISAteCAuL3dpcmVwcm94eSBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9wdWZmZXJmZmlzaC93aXJlcHJveHkvcmVsZWFzZXMvZG93bmxvYWQvdjEuMS4zL3dpcmVwcm94eV9saW51eF9hbWQ2NC50YXIuZ3ogd2lyZXByb3h5LnRhci5negogIHRhciB4emYgd2lyZXByb3h5LnRhci5negpmaQoKIyBEb2VzICQxIG1hdGNoIGFueSBlbnRyeSBpbiB0aGUgY29tbWEtc2VwYXJhdGVkICRGT1JCSUQgbGlzdD8gQW4gZW50cnkgZW5kaW5nCiMgaW4gJy4nIGlzIHRyZWF0ZWQgYXMgYSBwcmVmaXggc28gYSB3aG9sZSAvMjQtaXNoIGJsb2NrIGNhbiBiZSByZXNlcnZlZC4KaXNfZm9yYmlkZGVuKCkgewogIGxvY2FsIGlwPSIkMSIgZW50cnkKICBbWyAteiAiJEZPUkJJRCIgXV0gJiYgcmV0dXJuIDEKICBsb2NhbCBJRlM9JywnCiAgZm9yIGVudHJ5IGluICRGT1JCSUQ7IGRvCiAgICBlbnRyeT0iJHtlbnRyeS8vIC99IgogICAgW1sgLXogIiRlbnRyeSIgXV0gJiYgY29udGludWUKICAgIGlmIFtbICIkZW50cnkiID09ICouIF1dOyB0aGVuCiAgICAgIFtbICIkaXAiID09ICIkZW50cnkiKiBdXSAmJiByZXR1cm4gMAogICAgZWxzZQogICAgICBbWyAiJGlwIiA9PSAiJGVudHJ5IiBdXSAmJiByZXR1cm4gMAogICAgZmkKICBkb25lCiAgcmV0dXJuIDEKfQoKZXhpdF9pcD0iIjsgY29sbz0iIjsgd2FycD0iIjsgbG9jPSIiOyByb2xsPTA7IHdwX3BpZD0iIgp3aGlsZSAoKCByb2xsIDwgTUFYX1JPTExTICkpOyBkbwogIHJvbGw9JCgoIHJvbGwgKyAxICkpCiAgIyBLaWxsIG9ubHkgdGhlIHdpcmVwcm94eSBUSElTIGludm9jYXRpb24gc3RhcnRlZC4gSXQgdXNlZCB0byBiZQogICMgYHBraWxsIC1mICd3aXJlcHJveHkgLWMnYCwgd2hpY2gga2lsbGVkIGV2ZXJ5IHdpcmVwcm94eSBvbiB0aGUgYm94IC0tIGZpbmUKICAjIHdoZW4gb25lIHR1bm5lbCBleGlzdGVkLCBmYXRhbCBvbmNlIGEgY2FsbGVyIHJ1bnMgc2V2ZXJhbCBzaWRlIGJ5IHNpZGUgdG8KICAjIGdldCBzZXZlcmFsIGV4aXQgSVBzLCBiZWNhdXNlIGVhY2ggbmV3IHJvbGwgdG9yZSBkb3duIGl0cyBzaWJsaW5ncy4KICBbWyAtbiAiJHdwX3BpZCIgXV0gJiYga2lsbCAiJHdwX3BpZCIgMj4vZGV2L251bGwKICB3cF9waWQ9IiIKICBzbGVlcCAxCgogICMgQSBmcmVzaCBhbm9ueW1vdXMgcmVnaXN0cmF0aW9uIGVhY2ggcm9sbDogbm8gc2lnbnVwLCBubyBjcmVkZW50aWFscy4gRGVsZXRpbmcKICAjIHRoZSBhY2NvdW50IGZpbGUgaXMgd2hhdCBtYWtlcyBpdCBmcmVzaCByYXRoZXIgdGhhbiByZXVzZWQuCiAgcm0gLWYgd2djZi1hY2NvdW50LnRvbWwgd2djZi1wcm9maWxlLmNvbmYKICAuL3dnY2YgcmVnaXN0ZXIgLS1hY2NlcHQtdG9zID4vZGV2L251bGwKICAuL3dnY2YgZ2VuZXJhdGUgPi9kZXYvbnVsbAoKICBjcCB3Z2NmLXByb2ZpbGUuY29uZiB3cC5jb25mCiAgaWYgW1sgLW4gIiRFTkRQT0lOVF9IT1NUIiBdXTsgdGhlbgogICAgc2VkIC1pICJzfF5FbmRwb2ludCAqPS4qfEVuZHBvaW50ID0gJHtFTkRQT0lOVF9IT1NUfToke0VORFBPSU5UX1BPUlQ6LTI0MDh9fCIgd3AuY29uZgogIGZpCiAgcHJpbnRmICdcbltTb2NrczVdXG5CaW5kQWRkcmVzcyA9IDEyNy4wLjAuMTolc1xuJyAiJEJJTkRfUE9SVCIgPj4gd3AuY29uZgogIC4vd2lyZXByb3h5IC1jIHdwLmNvbmYgPndpcmVwcm94eS5sb2cgMj4mMSAmCiAgd3BfcGlkPSQhCgogIGZvciBfIGluICQoc2VxIDEgMzApOyBkbwogICAgY3VybCAtcyAtLW1heC10aW1lIDUgLS1zb2NrczUtaG9zdG5hbWUgIjEyNy4wLjAuMTokQklORF9QT1JUIiBcCiAgICAgIGh0dHBzOi8vd3d3LmNsb3VkZmxhcmUuY29tL2Nkbi1jZ2kvdHJhY2UgPi9kZXYvbnVsbCAyPiYxICYmIGJyZWFrCiAgICBzbGVlcCAyCiAgZG9uZQoKICB0cmFjZT0kKGN1cmwgLXMgLS1tYXgtdGltZSAyMCAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgIGh0dHBzOi8vd3d3LmNsb3VkZmxhcmUuY29tL2Nkbi1jZ2kvdHJhY2UgfHwgdHJ1ZSkKICBleGl0X2lwPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmlwPS8vcCcpCiAgY29sbz0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL15jb2xvPS8vcCcpCiAgd2FycD0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL153YXJwPS8vcCcpCiAgbG9jPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmxvYz0vL3AnKQogICMgV0FSUCBpcyBkdWFsIHN0YWNrIGFuZCBjZG4tY2dpL3RyYWNlIHJlcG9ydHMgd2hpY2hldmVyIGZhbWlseSB0aGUgcmVxdWVzdAogICMgdXNlZCDigJQgb3ZlciBXQVJQIHRoYXQgaXMgSVB2Ni4gQm90aCBoYXZlIHRvIGJlIGNhcHR1cmVkOiB0aGUgdjQgYWRkcmVzcyBpcwogICMgd2hhdCBlYXJsaWVyIGNvbGxpc2lvbnMgd2VyZSByZWNvcmRlZCBhcywgYW5kIGVpdGhlciBmYW1pbHkgY2FuIGJlIHRoZSBvbmUKICAjIGEgcGVlciBsYW5lIGhhcyBhbHJlYWR5IGNsYWltZWQuCiAgZXhpdF92ND0kKGN1cmwgLTQgLXMgLS1tYXgtdGltZSAxNSAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgIGh0dHBzOi8vYXBpLmlwaWZ5Lm9yZyB8fCB0cnVlKQogIGVjaG8gInJvbGw9JHJvbGwgZXhpdF9pcD0ke2V4aXRfaXA6LUZBSUxFRH0gZXhpdF92ND0ke2V4aXRfdjQ6LW5vbmV9IGNvbG89JHtjb2xvOi11bmtub3dufSB3YXJwPSR7d2FycDotdW5rbm93bn0iCgogIGlmIFtbIC16ICIkZXhpdF9pcCIgfHwgIiR3YXJwIiAhPSAib24iIF1dOyB0aGVuCiAgICBlY2hvICIgIHR1bm5lbCBkaWQgbm90IGNvbWUgdXAgb24gcm9sbCAkcm9sbCIgPiYyCiAgICBjb250aW51ZQogIGZpCiAgaWYgaXNfZm9yYmlkZGVuICIkZXhpdF9pcCIgfHwgeyBbWyAtbiAiJGV4aXRfdjQiIF1dICYmIGlzX2ZvcmJpZGRlbiAiJGV4aXRfdjQiOyB9OyB0aGVuCiAgICBlY2hvICIgIGV4aXQgJHtleGl0X3Y0Oi0kZXhpdF9pcH0gaXMgaW4gV0FSUF9GT1JCSURfRVhJVFMg4oCUIHJlLXJvbGxpbmciID4mMgogICAgZXhpdF9pcD0iIgogICAgY29udGludWUKICBmaQogIGJyZWFrCmRvbmUKCmVjaG8gImVuZHBvaW50X3VzZWQ9JChncmVwIC1FICdeRW5kcG9pbnQnIHdwLmNvbmYgfCBoZWFkIC0xIHwgc2VkICdzLy4qPSAqLy8nKSIKZWNobyAiZXhpdF9pcD0ke2V4aXRfaXA6LUZBSUxFRH0iCmVjaG8gImV4aXRfdjQ9JHtleGl0X3Y0Oi1ub25lfSIKZWNobyAiY29sbz0ke2NvbG86LXVua25vd259IgplY2hvICJ3YXJwPSR7d2FycDotdW5rbm93bn0iCmVjaG8gImxvYz0ke2xvYzotdW5rbm93bn0iCmVjaG8gInJvbGxzX3VzZWQ9JHJvbGwiCgppZiBbWyAteiAiJGV4aXRfaXAiIHx8ICIkd2FycCIgIT0gIm9uIiBdXTsgdGhlbgogIGVjaG8gIm5vIGFjY2VwdGFibGUgV0FSUCBleGl0IGFmdGVyICRyb2xsIHJvbGxzIChmb3JiaWQ9JyRGT1JCSUQnKSIgPiYyCiAgdGFpbCAtMjAgd2lyZXByb3h5LmxvZyA+JjIgfHwgdHJ1ZQogIGV4aXQgMQpmaQo=' | base64 -d > warp_up.sh
           chmod +x warp_up.sh
-          # Falling through to the runner's own egress would mint nothing but
-          # 600010 for hours, so a failed tunnel must kill the job.
-          ./warp_up.sh "$SOCKS_PORT" | tee /tmp/warp.txt | sed 's/^/warp_/'
-          echo "EXITIP=$(sed -n 's/^exit_v4=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
-          echo "EXITV6=$(sed -n 's/^exit_ip=//p' /tmp/warp.txt | tail -1)" >> "$GITHUB_ENV"
+
+          : > /tmp/tunnels.txt
+          # Each exit already taken is refused for the next roll -- two producers
+          # behind ONE exit is measurably fatal (one sustains, the other gets
+          # nothing but 300030), so fewer tunnels beats duplicated ones.
+          CLAIMED="${FORBID:-}"
+          for n in $(seq 0 $(( TUNNELS - 1 ))); do
+            d=/tmp/warp/$n; mkdir -p "$d"; cp -f /tmp/warp/warp_up.sh "$d/"
+            # Reuse tunnel 0's downloads; the release CDN 504s in bursts and
+            # there is no reason to pull the same two binaries N times.
+            [ -x /tmp/warp/0/wgcf ] && cp -f /tmp/warp/0/wgcf /tmp/warp/0/wireproxy "$d/" 2>/dev/null
+            port=$(( SOCKS_PORT + n ))
+            ( cd "$d" && WARP_FORBID_EXITS="$CLAIMED" WARP_MAX_ROLLS=10 ./warp_up.sh "$port" ) \
+              > "$d/out.txt" 2>&1
+            v4=$(sed -n 's/^exit_v4=//p' "$d/out.txt" | tail -1)
+            v6=$(sed -n 's/^exit_ip=//p'  "$d/out.txt" | tail -1)
+            colo=$(sed -n 's/^colo=//p'   "$d/out.txt" | tail -1)
+            if [ -n "$v4" ] && [ "$v4" != "none" ] && [ "$v4" != "FAILED" ]; then
+              echo "$n $port $v4 ${colo:-unknown}" >> /tmp/tunnels.txt
+              CLAIMED="${CLAIMED:+$CLAIMED,}$v4"
+              echo "tunnel $n  port=$port  exit=$v4  colo=${colo:-unknown}  v6=${v6:-none}"
+            else
+              echo "tunnel $n FAILED to register -- continuing with fewer"
+              tail -4 "$d/out.txt"
+            fi
+          done
+
+          UP=$(wc -l < /tmp/tunnels.txt)
+          echo "tunnels_up=$UP of $TUNNELS"
+          [ "$UP" -ge 1 ] || { echo "::error::no WARP tunnel came up"; exit 1; }
+          echo "TUNNELS_UP=$UP" >> "$GITHUB_ENV"
+          echo "EXITIP=$(awk 'NR==1{print $3}' /tmp/tunnels.txt)" >> "$GITHUB_ENV"
 
       - name: 4a. Go toolchain (joinverify needs >= the version in its go.mod)
         uses: actions/setup-go@v5
@@ -359,46 +400,63 @@ jobs:
           # exits 1 when the count is zero, so `MINTED=$(grep -ac ...)` killed
           # this step 30s in, before the first token had been minted.
           set +e +o pipefail
-          export DISPLAY=:97
-          Xvfb :97 -screen 0 1280x900x24 -ac -nolisten tcp >/dev/null 2>&1 &
-          sleep 3
+          MINUTES="${MINUTES:-300}"
+          mapfile -t TUNS < /tmp/tunnels.txt
+          NINST=${#TUNS[@]}
+          echo "starting $NINST producer instance(s) -- one browser per exit IP"
 
-          LOG=/tmp/chrome.log
-          : > "$LOG"
-          # Plain browser, no automation protocol. --proxy-server sends every
-          # request (including the relay POST) through WARP; Chromium resolves
-          # DNS remotely for socks5://, so nothing leaks to the runner resolver.
-          # DisableLoadExtensionCommandLineSwitch: Chrome >=137 ignores
-          # --load-extension without it.
-          "$CHROME_BIN" \
-            --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
-            --disable-dev-shm-usage \
-            --user-data-dir=/tmp/chrome-profile \
-            --window-position=0,0 --window-size=1280,880 \
-            --proxy-server="socks5://127.0.0.1:$SOCKS_PORT" \
-            --disable-features=DisableLoadExtensionCommandLineSwitch \
-            --disable-extensions-except=/tmp/ext \
-            --load-extension=/tmp/ext \
-            --enable-logging=stderr --v=0 \
-            "https://gartic.io/" >> "$LOG" 2>&1 &
-          CHROME_PID=$!
+          # One Xvfb PER INSTANCE. Every browser then sits at 0,0 on its own
+          # display, so the CLICKAT screen coordinates are identical but never
+          # collide, and no window can occlude another instance's checkbox.
+          for t in "${TUNS[@]}"; do
+            set -- $t
+            Xvfb ":$(( 97 + $1 ))" -screen 0 1280x900x24 -ac -nolisten tcp >/dev/null 2>&1 &
+          done
+          sleep 4
 
-          # Fail fast and loudly if the extension never ran at all -- that is a
+          # Plain browsers, no automation protocol. --proxy-server sends every
+          # request (including the relay POST) through that instance's WARP
+          # tunnel; Chromium resolves DNS remotely for socks5://, so nothing
+          # leaks to the runner resolver. DisableLoadExtensionCommandLineSwitch:
+          # Chrome >=137 ignores --load-extension without it.
+          IDX=(); PIDS=(); PORTS=(); LOGS=()
+          for t in "${TUNS[@]}"; do
+            set -- $t; n=$1; port=$2; v4=$3; colo=$4
+            log="/tmp/chrome-$n.log"; : > "$log"; : > "/tmp/clicks-$n.log"
+            DISPLAY=":$(( 97 + n ))" "$CHROME_BIN" \
+              --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
+              --disable-dev-shm-usage \
+              --user-data-dir="/tmp/chrome-profile-$n" \
+              --window-position=0,0 --window-size=1280,880 \
+              --proxy-server="socks5://127.0.0.1:$port" \
+              --disable-features=DisableLoadExtensionCommandLineSwitch \
+              --disable-extensions-except=/tmp/ext \
+              --load-extension=/tmp/ext \
+              --enable-logging=stderr --v=0 \
+              "https://gartic.io/" >> "$log" 2>&1 &
+            IDX+=("$n"); PIDS+=($!); PORTS+=("$port"); LOGS+=("$log")
+            echo "instance $n -> display :$(( 97 + n ))  socks $port  exit $v4 ($colo)"
+          done
+
+          # Fail loudly only if NO instance ran the extension -- that is a
           # different bug from "the challenge did not solve", and conflating the
-          # two is what cost the previous session its diagnosis.
+          # two is what cost an earlier session its diagnosis.
           for _ in $(seq 1 24); do
-            grep -aq '\[producer\]' "$LOG" && break
+            up=0
+            for l in "${LOGS[@]}"; do grep -aq '\[producer\]' "$l" && up=$(( up + 1 )); done
+            [ "$up" -eq "$NINST" ] && break
             sleep 5
           done
-          if ! grep -aq '\[producer\]' "$LOG"; then
+          up=0; for l in "${LOGS[@]}"; do grep -aq '\[producer\]' "$l" && up=$(( up + 1 )); done
+          if [ "$up" -eq 0 ]; then
             echo "::error::extension never executed -- --load-extension was ignored or the page never loaded"
             echo "--- chrome version ---"; "$CHROME_BIN" --version
-            echo "--- last 40 log lines ---"; tail -40 "$LOG"
+            echo "--- last 40 log lines ---"; tail -40 "${LOGS[0]}"
             exit 1
           fi
-          echo "extension is running"
+          echo "extension is running in $up/$NINST instance(s)"
 
-          # --- click driver ----------------------------------------------------
+          # --- click driver, one per instance ----------------------------------
           # Every challenge on a runner escalates to interactive mode and then
           # waits for a click that a browser nobody is driving never makes.
           # xdotool goes through XTEST, so Chromium receives genuine input
@@ -406,14 +464,14 @@ jobs:
           # what this whole no-automation-protocol recipe exists to avoid.
           # Positions come from the extension's CLICKAT lines (screen coords),
           # so nothing here has to guess where the widget is.
-          clicks=0
-          (
-            last=0
+          click_driver() {
+            local idx="$1" log="/tmp/chrome-$1.log" last=0 total
+            export DISPLAY=":$(( 97 + idx ))"
             while :; do
               sleep 4
-              total=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+              total=$(wc -c < "$log" 2>/dev/null || echo 0)
               [ "${total:-0}" -le "$last" ] && continue
-              tail -c +$(( last + 1 )) "$LOG" 2>/dev/null \
+              tail -c +$(( last + 1 )) "$log" 2>/dev/null \
                 | grep -ao 'CLICKAT lane=[0-9]* x=-\?[0-9]* y=-\?[0-9]*' \
                 | awk '{print $2, $3, $4}' | sed 's/[a-z]*=//g' | sort -u -k1,1 \
                 | while read -r ln x y; do
@@ -422,32 +480,43 @@ jobs:
                     xdotool mousemove --sync $(( x - 40 )) $(( y - 25 )) sleep 0.12 \
                             mousemove --sync $(( x - 12 )) $(( y - 6 ))  sleep 0.09 \
                             mousemove --sync "$x" "$y" sleep 0.18 click 1 >/dev/null 2>&1
-                    echo "[click] lane=$ln at $x,$y" >> /tmp/clicks.log
+                    echo "[click] inst=$idx lane=$ln at $x,$y" >> "/tmp/clicks-$idx.log"
                   done
               last=$total
             done
-          ) &
-          CLICKER_PID=$!
-          : > /tmp/clicks.log
+          }
+          CLICKERS=()
+          for n in "${IDX[@]}"; do click_driver "$n" & CLICKERS+=($!); done
+
+          sum_over() {   # $1 = grep pattern, counted across every instance log
+            local s=0 c
+            for l in "${LOGS[@]}"; do c=$(grep -ac "$1" "$l" 2>/dev/null); s=$(( s + ${c:-0} )); done
+            echo "$s"
+          }
 
           END=$(( $(date +%s) + MINUTES * 60 ))
-          verified=0; accepted=0; lastcheck=0
+          verified=0; accepted=0; lastcheck=0; vturn=0
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 30
-            kill -0 "$CHROME_PID" 2>/dev/null || { echo "chrome exited"; break; }
+            alive=0
+            for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=$(( alive + 1 )); done
+            [ "$alive" -eq 0 ] && { echo "all chrome instances exited"; break; }
 
             # grep -c always prints a number but exits 1 on no match, so a
             # `|| echo 0` fallback would capture "0\n0" and break the arithmetic.
-            MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null || true); MINTED=${MINTED:-0}
-            POSTED=$(grep -ao 'posted=[0-9]*' "$LOG" 2>/dev/null | tail -1 || true); POSTED=${POSTED:-posted=0}
-            CLICKS=$(grep -ac '^\[click\]' /tmp/clicks.log 2>/dev/null || true); CLICKS=${CLICKS:-0}
-            NOW=$(date +%s)
-            echo "[summary] t=$(( NOW - (END - MINUTES*60) ))s minted=$MINTED $POSTED clicks=$CLICKS accepted=$accepted/$verified exit=${EXITIP:-unknown}"
+            MINTED=$(sum_over 'TOKFULL ')
+            CLICKS=$(cat /tmp/clicks-*.log 2>/dev/null | grep -ac '^\[click\]'); CLICKS=${CLICKS:-0}
+            NOW=$(date +%s); EL=$(( NOW - (END - MINUTES*60) ))
+            RATE=$(( EL > 0 ? MINTED * 60 / EL : 0 ))
+            echo "[summary] t=${EL}s minted=$MINTED rate=${RATE}/min clicks=$CLICKS alive=$alive/$NINST accepted=$accepted/$verified"
 
-            # Verify one fresh token every ~3 min. Tokens are single-use, so a
-            # verified one is spent -- keep this sparse. Never print the token.
+            # Verify one fresh token every ~3 min, ROTATING instances so every
+            # exit gets checked. Tokens are single-use, so a verified one is
+            # spent -- keep this sparse. Never print the token.
             if [ $(( NOW - lastcheck )) -ge 180 ] && [ "$MINTED" -gt 0 ]; then
               lastcheck=$NOW
+              vi=$(( vturn % NINST )); vturn=$(( vturn + 1 ))
+              vlog="${LOGS[$vi]}"; vport="${PORTS[$vi]}"; vn="${IDX[$vi]}"
               # Chrome's console log appends `", source: <url> (line)` to EVERY
               # line. The old extraction was `tr -d '"'`, which deletes the quote
               # characters but leaves that suffix glued onto the token -- so the
@@ -455,47 +524,55 @@ jobs:
               # can only ever come back code=5. Cut at the first quote instead:
               # the token alphabet is base64url plus dots, so it never contains
               # one. This is why a 143-token run reported accepted=0/4.
-              LINE=$(grep -a 'TOKFULL ' "$LOG" | tail -1 | sed 's/.*TOKFULL //' | sed 's/".*$//' | tr -d '\r')
+              LINE=$(grep -a 'TOKFULL ' "$vlog" | tail -1 | sed 's/.*TOKFULL //' | sed 's/".*$//' | tr -d '\r')
               FLAG=${LINE%% *}; TOK=${LINE#* }
               if [ -n "$TOK" ] && [ "$TOK" != "$LINE" ]; then
-                V=$(/tmp/joinverify -proxy "socks5://127.0.0.1:$SOCKS_PORT" "$TOK" 2>&1 | tail -1)
+                # Verify through the SAME tunnel the token was minted on, so the
+                # check never introduces an exit the token did not come from.
+                V=$(/tmp/joinverify -proxy "socks5://127.0.0.1:$vport" "$TOK" 2>&1 | tail -1)
                 verified=$(( verified + 1 ))
                 case "$V" in JOINED*) accepted=$(( accepted + 1 ));; esac
                 # solve=int means this token came from a challenge that escalated
                 # to interactive and was clicked; solve=auto means it solved by
-                # itself. If int tokens are refused while auto ones are accepted,
-                # the click driver is producing tokens gartic will not take.
-                echo "[verify] solve=$FLAG len=${#TOK} $V   (running $accepted/$verified ACCEPTED)"
+                # itself.
+                echo "[verify] inst=$vn solve=$FLAG len=${#TOK} $V   (running $accepted/$verified ACCEPTED)"
               fi
             fi
           done
 
-          kill "$CLICKER_PID" 2>/dev/null
-          MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null || true); MINTED=${MINTED:-0}
-          CLICKS=$(grep -ac '^\[click\]' /tmp/clicks.log 2>/dev/null || true); CLICKS=${CLICKS:-0}
+          for c in "${CLICKERS[@]}"; do kill "$c" 2>/dev/null; done
+          MINTED=$(sum_over 'TOKFULL ')
+          CLICKS=$(cat /tmp/clicks-*.log 2>/dev/null | grep -ac '^\[click\]'); CLICKS=${CLICKS:-0}
+          EL=$(( $(date +%s) - (END - MINUTES*60) )); [ "$EL" -lt 1 ] && EL=1
           echo "=============================================="
-          echo "[result] exit_ip=${EXITIP:-unknown} minted=$MINTED clicks=$CLICKS accepted=$accepted/$verified"
+          echo "[result] instances=$NINST minted=$MINTED rate=$(( MINTED * 60 / EL ))/min clicks=$CLICKS accepted=$accepted/$verified"
           echo "=============================================="
+          echo "--- per instance ---"
+          for t in "${TUNS[@]}"; do
+            set -- $t; n=$1; v4=$3; colo=$4
+            m=$(grep -ac 'TOKFULL ' "/tmp/chrome-$n.log" 2>/dev/null); m=${m:-0}
+            echo "inst $n  exit=$v4 ($colo)  minted=$m  rate=$(( m * 60 / EL ))/min"
+          done
           echo "--- interactive-mode callbacks ---"
           for pat in BEFORE_INTERACTIVE AFTER_INTERACTIVE; do
-            echo "$pat: $(grep -ac "$pat" "$LOG" 2>/dev/null || true)"
+            echo "$pat: $(sum_over "$pat")"
           done
           echo "--- tokens by solve path ---"
           for pat in int auto; do
-            echo "solve=$pat: $(grep -ac "TOKFULL $pat " "$LOG" 2>/dev/null || true)"
+            echo "solve=$pat: $(sum_over "TOKFULL $pat ")"
           done
-          grep -a 'cf err' "$LOG" | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
+          cat "${LOGS[@]}" 2>/dev/null | grep -a 'cf err' | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
           if [ "$MINTED" -eq 0 ]; then
-            # The producer's own console lines live in $LOG and were previously
-            # never surfaced, so a zero-mint run showed nothing to diagnose --
-            # not even whether window.turnstile appeared. Dump them (never a
-            # TOKFULL line; the repo is public).
+            # The producer's own console lines live in the chrome logs and were
+            # previously never surfaced, so a zero-mint run showed nothing to
+            # diagnose -- not even whether window.turnstile appeared. Dump them
+            # (never a TOKFULL line; the repo is public).
             echo "--- producer console (deduped) ---"
-            grep -a 'producer\]' "$LOG" | grep -av 'TOKFULL' \
+            cat "${LOGS[@]}" 2>/dev/null | grep -a 'producer\]' | grep -av 'TOKFULL' \
               | sed 's/.*\[producer\]/[producer]/' \
               | sed 's/len=[0-9]* head=.*/len=... head=.../' \
               | sort | uniq -c | sort -rn | head -20
-            echo "--- clicks issued ---"; tail -5 /tmp/clicks.log 2>/dev/null
+            echo "--- clicks issued ---"; cat /tmp/clicks-*.log 2>/dev/null | tail -5
             echo "::error::minted 0. Read it off the counters above: clicks=0 means the widget never became clickable (CLICKAT never fired -- lane stayed collapsed); clicks>0 with BEFORE_INTERACTIVE>0 and AFTER_INTERACTIVE=0 means the click landed but Cloudflare still refused this browser/exit."
           fi
 
