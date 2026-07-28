@@ -89,7 +89,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb unzip
+          # xdotool drives the pointer through XTEST. Every runner challenge
+          # escalates to interactive mode and then waits forever for a click
+          # nobody makes -- see step 6's click driver.
+          sudo apt-get install -y --no-install-recommends xvfb unzip xdotool
 
           if [ "${BROWSER:-playwright}" = "playwright" ]; then
             # A CURRENT Chromium. Branded Chrome removed --load-extension in
@@ -189,9 +192,23 @@ jobs:
           MANIFEST
 
           # Runner variant of tunnel system/vm-chromium-producer/producer.js.
-          # Only difference: it emits the FULL token on a `TOKFULL` line so the
-          # job can verify acceptance. That line goes to the Chrome log file,
-          # which is never printed or uploaded -- the repo is public.
+          # Two differences from the VM copy:
+          #
+          #   1. It emits the FULL token on a `TOKFULL` line so the job can
+          #      verify acceptance. That line goes to the Chrome log file, which
+          #      is never printed or uploaded -- the repo is public.
+          #   2. It emits `CLICKAT lane=<i> x=<sx> y=<sy>` in SCREEN coordinates
+          #      for any lane that is on screen and still unsolved, so step 6's
+          #      xdotool driver can click the checkbox. On the runner every
+          #      challenge escalates to interactive mode (BEFORE_INTERACTIVE on
+          #      every build, AFTER_INTERACTIVE never, no `cf err`, no token,
+          #      across three different WARP exits in three colos) -- the widget
+          #      is not failing, it is waiting for a click. The VM never needed
+          #      this because most of its challenges never escalate.
+          #
+          # Lanes are 320px apart, not 180: an interaction-only widget is ~300px
+          # wide once it becomes visible, so the old spacing made them overlap
+          # and put lane 1's checkbox underneath lane 0.
           cat > /tmp/ext/producer.js <<'PRODUCER'
           (function () {
             'use strict';
@@ -215,12 +232,23 @@ jobs:
                 .catch(function(e){ log('relay error', e && e.message); });
             }
 
+            // Viewport point -> X11 screen point. outerHeight-innerHeight is the
+            // browser chrome above the page; the horizontal term splits any
+            // window border evenly. Self-correcting, so the window can sit
+            // anywhere without the click driver needing to know where.
+            function toScreen(r) {
+              var padX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+              var padY = Math.max(0, window.outerHeight - window.innerHeight);
+              return { x: Math.round((window.screenX || 0) + padX + r.left),
+                       y: Math.round((window.screenY || 0) + padY + r.top) };
+            }
+
             function lane(i) {
               var slot, id;
               function build() {
                 slot = document.createElement('div');
                 slot.id = 'prod_' + i;
-                slot.style.cssText = 'position:fixed;left:' + (10 + i*180) + 'px;bottom:10px;z-index:2147483647';
+                slot.style.cssText = 'position:fixed;left:' + (10 + i*320) + 'px;bottom:10px;z-index:2147483647';
                 document.body.appendChild(slot);
                 try {
                   id = window.turnstile.render(slot, {
@@ -239,6 +267,20 @@ jobs:
                 var el = slot && slot.querySelector('input[name="cf-turnstile-response"]');
                 return el && el.value ? el.value : null;
               }
+              // Publish where this lane's checkbox is, in screen coordinates, so
+              // the xdotool driver can hit it. Deliberately NOT tied to
+              // before-interactive: a lane that is on screen and unsolved wants
+              // a click whichever callback did or did not fire.
+              function emitClick() {
+                if (!slot) return;
+                var r = slot.getBoundingClientRect();
+                if (r.width < 20 || r.height < 20) return;   // still collapsed
+                var p = toScreen(r);
+                // The checkbox sits at the left end of an expanded widget; on a
+                // small box aim at its centre instead.
+                var ox = r.width >= 200 ? 30 : Math.round(r.width / 2);
+                log('CLICKAT lane=' + i + ' x=' + (p.x + ox) + ' y=' + (p.y + Math.round(r.height / 2)));
+              }
               function poll(n) {
                 var t = read();
                 if (t) {
@@ -253,6 +295,7 @@ jobs:
                   return;
                 }
                 if (n > 60) { recycle(); return; }
+                if (n % 5 === 2) emitClick();
                 setTimeout(function(){ poll(n+1); }, 1000);
               }
               function recycle() {
@@ -263,10 +306,28 @@ jobs:
               return build;
             }
 
+            // The old DIAG printed `iframes=0` for BOTH a minting VM and a dead
+            // runner, so it decided nothing -- a top-level
+            // `iframe[src*=challenges.cloudflare.com]` query misses an iframe
+            // that Turnstile put inside a descendant's shadow root. Report each
+            // lane's real size and iframe count, light DOM and shadow DOM, so a
+            // zero-mint run says whether the widget drew at all.
             setInterval(function(){
               var ifr = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length;
-              var boxes = document.querySelectorAll('[id^="prod_"]').length;
-              log('DIAG iframes=' + ifr + ' lanes=' + boxes + ' minted=' + minted + ' posted=' + posted);
+              var boxes = document.querySelectorAll('[id^="prod_"]');
+              var parts = [];
+              for (var b = 0; b < boxes.length; b++) {
+                var el = boxes[b], r = el.getBoundingClientRect();
+                var kids = el.querySelectorAll('*'), sr = 0;
+                for (var k = 0; k < kids.length; k++) {
+                  if (kids[k].shadowRoot) sr += kids[k].shadowRoot.querySelectorAll('iframe').length;
+                }
+                parts.push(el.id + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+                           ' ifr=' + el.querySelectorAll('iframe').length + ' srIfr=' + sr +
+                           ' resp=' + (el.querySelector('input[name="cf-turnstile-response"]') ? 1 : 0));
+              }
+              log('DIAG iframes=' + ifr + ' lanes=' + boxes.length + ' minted=' + minted +
+                  ' posted=' + posted + ' | ' + parts.join(' | '));
             }, 20000);
 
             var waited = 0;
@@ -312,6 +373,7 @@ jobs:
             --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
             --disable-dev-shm-usage \
             --user-data-dir=/tmp/chrome-profile \
+            --window-position=0,0 --window-size=1280,880 \
             --proxy-server="socks5://127.0.0.1:$SOCKS_PORT" \
             --disable-features=DisableLoadExtensionCommandLineSwitch \
             --disable-extensions-except=/tmp/ext \
@@ -335,6 +397,38 @@ jobs:
           fi
           echo "extension is running"
 
+          # --- click driver ----------------------------------------------------
+          # Every challenge on a runner escalates to interactive mode and then
+          # waits for a click that a browser nobody is driving never makes.
+          # xdotool goes through XTEST, so Chromium receives genuine input
+          # (isTrusted=true) -- unlike a CDP-dispatched event, which is exactly
+          # what this whole no-automation-protocol recipe exists to avoid.
+          # Positions come from the extension's CLICKAT lines (screen coords),
+          # so nothing here has to guess where the widget is.
+          clicks=0
+          (
+            last=0
+            while :; do
+              sleep 4
+              total=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+              [ "${total:-0}" -le "$last" ] && continue
+              tail -c +$(( last + 1 )) "$LOG" 2>/dev/null \
+                | grep -ao 'CLICKAT lane=[0-9]* x=-\?[0-9]* y=-\?[0-9]*' \
+                | awk '{print $2, $3, $4}' | sed 's/[a-z]*=//g' | sort -u -k1,1 \
+                | while read -r ln x y; do
+                    [ -n "$x" ] && [ -n "$y" ] || continue
+                    # An approach path with pauses reads less like a teleport.
+                    xdotool mousemove --sync $(( x - 40 )) $(( y - 25 )) sleep 0.12 \
+                            mousemove --sync $(( x - 12 )) $(( y - 6 ))  sleep 0.09 \
+                            mousemove --sync "$x" "$y" sleep 0.18 click 1 >/dev/null 2>&1
+                    echo "[click] lane=$ln at $x,$y" >> /tmp/clicks.log
+                  done
+              last=$total
+            done
+          ) &
+          CLICKER_PID=$!
+          : > /tmp/clicks.log
+
           END=$(( $(date +%s) + MINUTES * 60 ))
           verified=0; accepted=0; lastcheck=0
           while [ "$(date +%s)" -lt "$END" ]; do
@@ -345,8 +439,9 @@ jobs:
             # `|| echo 0` fallback would capture "0\n0" and break the arithmetic.
             MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null || true); MINTED=${MINTED:-0}
             POSTED=$(grep -ao 'posted=[0-9]*' "$LOG" 2>/dev/null | tail -1 || true); POSTED=${POSTED:-posted=0}
+            CLICKS=$(grep -ac '^\[click\]' /tmp/clicks.log 2>/dev/null || true); CLICKS=${CLICKS:-0}
             NOW=$(date +%s)
-            echo "[summary] t=$(( NOW - (END - MINUTES*60) ))s minted=$MINTED $POSTED accepted=$accepted/$verified exit=${EXITIP:-unknown}"
+            echo "[summary] t=$(( NOW - (END - MINUTES*60) ))s minted=$MINTED $POSTED clicks=$CLICKS accepted=$accepted/$verified exit=${EXITIP:-unknown}"
 
             # Verify one fresh token every ~3 min. Tokens are single-use, so a
             # verified one is spent -- keep this sparse. Never print the token.
@@ -362,10 +457,16 @@ jobs:
             fi
           done
 
+          kill "$CLICKER_PID" 2>/dev/null
           MINTED=$(grep -ac 'TOKFULL ' "$LOG" 2>/dev/null || true); MINTED=${MINTED:-0}
+          CLICKS=$(grep -ac '^\[click\]' /tmp/clicks.log 2>/dev/null || true); CLICKS=${CLICKS:-0}
           echo "=============================================="
-          echo "[result] exit_ip=${EXITIP:-unknown} minted=$MINTED accepted=$accepted/$verified"
+          echo "[result] exit_ip=${EXITIP:-unknown} minted=$MINTED clicks=$CLICKS accepted=$accepted/$verified"
           echo "=============================================="
+          echo "--- interactive-mode callbacks ---"
+          for pat in BEFORE_INTERACTIVE AFTER_INTERACTIVE; do
+            echo "$pat: $(grep -ac "$pat" "$LOG" 2>/dev/null || true)"
+          done
           grep -a 'cf err' "$LOG" | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
           if [ "$MINTED" -eq 0 ]; then
             # The producer's own console lines live in $LOG and were previously
@@ -377,7 +478,8 @@ jobs:
               | sed 's/.*\[producer\]/[producer]/' \
               | sed 's/len=[0-9]* head=.*/len=... head=.../' \
               | sort | uniq -c | sort -rn | head -20
-            echo "::error::minted 0. No 'cf err' at all means the challenge never errored AND never solved -- suspect the browser build, not the exit IP."
+            echo "--- clicks issued ---"; tail -5 /tmp/clicks.log 2>/dev/null
+            echo "::error::minted 0. Read it off the counters above: clicks=0 means the widget never became clickable (CLICKAT never fired -- lane stayed collapsed); clicks>0 with BEFORE_INTERACTIVE>0 and AFTER_INTERACTIVE=0 means the click landed but Cloudflare still refused this browser/exit."
           fi
 
       - name: 7. Dispatch successor
