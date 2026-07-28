@@ -67,18 +67,35 @@ jobs:
           google-chrome --version || true
           chromium --version || true
 
-      - name: 2. Install Xvfb (+ Chrome is preinstalled on ubuntu-24.04)
+      - name: 2. Install Xvfb + a Chrome that still honours --load-extension
         run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends xvfb
-          # ubuntu-24.04 runner images ship google-chrome-stable. Fall back to a
-          # direct .deb only if that ever stops being true -- NOT to the snap
-          # `chromium` package, whose confinement breaks --load-extension.
-          if ! command -v google-chrome >/dev/null; then
-            curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-            sudo apt-get install -y /tmp/chrome.deb
-          fi
-          google-chrome --version
+          sudo apt-get install -y --no-install-recommends xvfb unzip
+
+          # The runner's preinstalled Chrome is 150. Chrome REMOVED
+          # --load-extension in M137 (and the
+          # --disable-features=DisableLoadExtensionCommandLineSwitch escape
+          # hatch with it), so on the stock browser the extension silently never
+          # runs -- which is exactly how this failed on the first attempt.
+          # Chrome for Testing 136 is the last line that still loads it, and
+          # pinning is the same discipline the Camoufox v135 pin exists for.
+          #
+          # NOT the apt `chromium` package: on 24.04 that is a snap wrapper
+          # whose confinement cannot read /tmp/ext.
+          VER=$(curl -fsSL --retry 3 https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json \
+            | jq -r '[.versions[]
+                      | select((.version | split(".")[0] | tonumber) == 136)
+                      | select(any(.downloads.chrome[]?; .platform == "linux64"))
+                      | .version] | last')
+          [ -n "$VER" ] && [ "$VER" != "null" ] || { echo 'no Chrome-for-Testing 136 build found' >&2; exit 1; }
+          echo "pinning Chrome for Testing $VER"
+          curl -fsSL --retry 3 -o /tmp/cft.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/$VER/linux64/chrome-linux64.zip"
+          sudo unzip -q /tmp/cft.zip -d /opt
+          sudo chmod -R a+rX /opt/chrome-linux64
+          echo "CHROME_BIN=/opt/chrome-linux64/chrome" >> "$GITHUB_ENV"
+          /opt/chrome-linux64/chrome --version
 
       - name: 3. Bring up Cloudflare WARP (SOCKS5) -- FATAL if it fails
         env:
@@ -250,7 +267,7 @@ jobs:
           # DNS remotely for socks5://, so nothing leaks to the runner resolver.
           # DisableLoadExtensionCommandLineSwitch: Chrome >=137 ignores
           # --load-extension without it.
-          google-chrome \
+          "$CHROME_BIN" \
             --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
             --disable-dev-shm-usage \
             --user-data-dir=/tmp/chrome-profile \
@@ -271,7 +288,8 @@ jobs:
           done
           if ! grep -aq '\[producer\]' "$LOG"; then
             echo "::error::extension never executed -- --load-extension was ignored or the page never loaded"
-            grep -aiE 'extension|ERROR' "$LOG" | tail -20
+            echo "--- chrome version ---"; "$CHROME_BIN" --version
+            echo "--- last 40 log lines ---"; tail -40 "$LOG"
             exit 1
           fi
           echo "extension is running"
