@@ -32,7 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.CHAIN_PAT }}
           GH_REPO: ${{ github.repository }}   # tells gh which repo without a checkout
-          PRODUCER: gartic-camoufox-linux.yml
+          PRODUCER: gartic-chromium-warp.yml
           TARGET: 20
         run: |
           set -e
@@ -51,7 +51,7 @@ jobs:
 
           echo "Dispatching $deficit producer(s) to refill the chain..."
           for ((i=0; i<deficit; i++)); do
-            if gh workflow run "$PRODUCER"; then
+            if gh workflow run "$PRODUCER" \n                 -f minutes=300 -f tunnels=6 -f lanes=2 -f per_min=12 \n                 -f strip_dom=true -f click_style=simple \n                 -f verify_every=600 -f post_to_relay=true -f chain=false; then
               echo "  dispatched $((i+1))/$deficit"
             else
               echo "  dispatch $((i+1))/$deficit FAILED — next supervisor tick will retry"
