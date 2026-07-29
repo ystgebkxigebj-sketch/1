@@ -1,0 +1,1147 @@
+name: Gartic producer (Chromium + MV3 extension, WARP)
+
+# Replaces the Camoufox producer fleet, which cannot mint any more:
+#
+#   1. Its egress is AS8075 Microsoft, which Cloudflare refuses the challenge to
+#      (measured 2026-07-24: direct 0 tokens / 93x 600010, WARP 238, VPN Gate 99).
+#   2. Its embedded generator renders WITHOUT `action:'join'`, and gartic
+#      validates that field server-side -- every such token is refused code 5.
+#   3. It pins `camoufox==0.4.11` but `camoufox fetch` now pulls v152, which
+#      yields zero tokens.
+#
+# This workflow is the GitHub port of the recipe that is live and minting on the
+# Oracle VM (`tunnel system/vm-chromium-producer/`): a PLAIN Chromium with no
+# automation protocol attached, doing the work from an MV3 content script in the
+# MAIN world, egressing through an anonymous Cloudflare WARP registration.
+#
+# On the diagnostic signature that misled the previous session: a healthy
+# producer logs `DIAG iframes=0` and fires `before-interactive`. That is what
+# `appearance:'interaction-only'` looks like, NOT a failure -- the live VM
+# producer prints exactly that while minting. Do not treat it as a verdict.
+# The only verdict that counts is the ACCEPTED ratio this workflow prints.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to mint for"
+        required: false
+        default: "300"
+      lanes:
+        description: "Parallel Turnstile widgets (2 is the measured optimum)"
+        required: false
+        default: "2"
+      per_min:
+        description: "Per-IP mint cap. Above ~12-14 gartic refuses everything."
+        required: false
+        default: "12"
+      post_to_relay:
+        description: "POST minted tokens to the relay (false = verify only)"
+        required: false
+        default: "true"
+      chain:
+        description: "Dispatch a successor when this run ends"
+        required: false
+        default: "false"
+      forbid_exits:
+        # Empty by DEFAULT and it must stay that way. WARP's IPv4 is anycast --
+        # every lane shares one address (the VM's lanes all sit on
+        # 104.28.196.79) and only the IPv6 /64 actually differs. Seeding this
+        # with a v4 makes warp_up.sh reject every roll and fail the job: an
+        # earlier run burned all 4 rolls on 104.28.196.79/IAD for exactly that
+        # reason. Put a v6 prefix here if a real collision needs excluding.
+        description: "WARP exits to refuse. Use IPv6 prefixes -- the v4 is anycast and always collides."
+        required: false
+        default: ""
+      warp_identity:
+        # base64 of a complete wgcf-profile.conf for a PRE-EXISTING, AGED WARP
+        # registration. Empty (the default) keeps the historical behaviour: each
+        # tunnel registers a fresh anonymous device.
+        #
+        # The hypothesis: the Oracle VM reuses one long-lived registration and is
+        # accepted for days, while every runner registers a fresh one and is cut
+        # within about an hour. If standing follows the REGISTRATION rather than
+        # the host, injecting an aged identity moves it to the runner.
+        #
+        # Only tunnel 0 receives it, and `tunnels` must be 1: one WireGuard key
+        # used from two endpoints at once makes the Cloudflare peer re-pin to
+        # whichever handshook last, so both lanes flap. The identity must also
+        # not be live on the VM at the same time.
+        description: "base64 wgcf-profile.conf of an aged WARP identity (empty = fresh registration)"
+        required: false
+        default: ""
+      appearance:
+        # We copied appearance:'interaction-only' from gartic's own client, but
+        # we are not gartic's client -- we only need tokens that pass siteverify
+        # with action:'join'. How the widget LOOKS is our choice, and this mode
+        # is expensive: it stays invisible until Cloudflare demands interaction,
+        # which on a datacenter IP is EVERY time (measured: 100% solve=int on
+        # runners). Every solve then costs a click and is scrutinised, capping
+        # an exit near 12 tok/min.
+        #
+        # The year-old Camoufox generator set NO appearance -- the default
+        # managed widget, which auto-solves with no click -- and sustained
+        # ~47 tok/min per IP, 4x what we get. That is the workaround this input
+        # exists to test. ('always' renders the widget visibly and lets it
+        # self-solve; the click driver is skipped in that mode, since clicking a
+        # widget that is already solving only interferes.)
+        description: "interaction-only (invisible, needs a click) or always (visible, self-solving)"
+        required: false
+        default: "interaction-only"
+      rotate_fp:
+        # The operator's experience, from running this a year ago: a single
+        # browser instance decays after a while and its tokens stop being
+        # accepted even though Cloudflare keeps issuing them -- and Camoufox was
+        # the only thing that fixed it. A bench confirmed the mechanism is real:
+        # across 4 Camoufox launches, canvasHash and webglRenderer differed
+        # EVERY time while userAgent/platform/timezone stayed constant. So it
+        # re-rolls precisely the high-entropy vectors.
+        # Chromium never re-rolls anything, and --user-agent/--window-size/--lang
+        # CANNOT reach canvas or WebGL, which is why this lives in the extension
+        # rather than in flags.
+        #
+        # ⚠️ MEASURED AND IT DOES NOT WORK. Controlled local A/B, same IP, same
+        # 10-minute window, control run LAST (so most depleted):
+        #     canvas + WebGL + cores spoof -> 0 minted
+        #     canvas noise alone           -> 0 minted
+        #     no rotation (control)        -> 20 minted, 4/4 accepted, no cf err
+        # Cloudflare detects a JS-level canvas patch and simply stops issuing --
+        # not "issues tokens gartic then refuses", but no tokens at all. You
+        # cannot fake this from inside the page: any override is visible to the
+        # same JS that reads it. Camoufox patches at the C++/Gecko level, which
+        # is exactly why it can rotate identity and this cannot.
+        # KEEP THIS false. It is retained only to document the negative.
+        description: "BROKEN - JS canvas/WebGL spoofing stops Cloudflare issuing entirely. Keep false."
+        required: false
+        default: "false"
+      recycle_min:
+        # Rotation only helps if it actually happens again. Reloading the page
+        # re-runs the content script with a fresh seed, which is far cheaper
+        # than restarting Chromium and loses only the in-flight widgets.
+        description: "Reload each page every N minutes to draw a fresh identity (0 = never)"
+        required: false
+        default: "0"
+      click_style:
+        # The operator observed, on a degraded IP, that a HAND click on the
+        # checkbox succeeded where the synthetic one did not. Cloudflare can
+        # hand back a token client-side and still fail it at siteverify if it
+        # judged the interaction fraudulent -- which looks exactly like our
+        # symptom: getResponse() returns a full-length token (mint counter
+        # rises) and gartic then refuses it code=5. So click realism may affect
+        # ACCEPTANCE, not just whether a token appears.
+        # MEASURED A/B, 3 tunnels, ~20 min apart on rested exits:
+        #   simple -> 364 minted, 29/min, 12/12 accepted, 401 clicks
+        #   human  -> 193 minted, 16/min, 10/11 accepted, 217 clicks
+        # Realism bought nothing on a rested exit and cost 45% of production:
+        # each human click issues 20+ synced mousemoves plus an awk spawn, so
+        # the driver lands about half as many clicks per cycle and tokens track
+        # clicks nearly 1:1. Depletion does not explain it (cumulative ~557 here
+        # vs ~2000 when decay set in). Default back to `simple`; `human` stays
+        # for the untested case that matters -- whether it extends the budget on
+        # a DEPLETED exit, which is where the operator saw a hand click succeed
+        # and a synthetic one fail.
+        description: "simple (3-hop teleport, faster) or human (eased path, jitter, press-hold)"
+        required: false
+        default: "simple"
+      verify_every:
+        # Seconds between acceptance checks. 180 gives only ~4 samples in a
+        # 12-minute run, which cannot separate a real acceptance drop from
+        # noise -- 4 tunnels scored 2/4 against 3 tunnels' 4/4 and that is not
+        # a decidable difference. Each check spends one token (they are
+        # single-use), which at 30+/min is under 2% of production.
+        description: "Seconds between acceptance checks. Lower = more samples, costs one token each."
+        required: false
+        default: "180"
+      strip_dom:
+        # Throughput on a runner is CPU-bound (3 and 5 tunnels both total
+        # 27/min), and most of that CPU is gartic's animated Next.js homepage,
+        # not Turnstile. We need the origin and window.turnstile, not the UI.
+        description: "Drop gartic's DOM once turnstile is captured, to free CPU for solving"
+        required: false
+        default: "true"
+      tunnels:
+        # ⚠️ RETRACTED 2026-07-29: the "43/58 and 54/59 accepted" figures below
+        # were produced by THIS WORKFLOW'S OWN VERIFIER, which replays each
+        # token through the WARP tunnel that minted it. A token from an
+        # over-driven exit still passes when redeemed from that same exit, so
+        # the instrument was blind to the exact failure it was measuring. It
+        # reported 54/59 accepted while icebot was refused 100% code 5 and
+        # production was down for an hour.
+        #
+        # RE-MEASURED with icebot's real joins as ground truth:
+        #   1 tunnel  (~11/min per exit) -> 53 joins /    3 code-5  ✅
+        #   3 tunnels (~33/min, ONE IP)  -> 27 joins /  175 code-5  ❌ 86% fail
+        #   6 tunnels x 20 workers       ->  0 joins / 1041 code-5  ❌ outage
+        #
+        # WARP's IPv4 is anycast: 5 fresh registrations on one runner all drew
+        # 104.28.196.79. So N tunnels is NOT N exits, it is N times the traffic
+        # on ONE address, and gartic rate-limits acceptance per solving IP at
+        # roughly 12 accepted tok/min. The "quota keys on storage identity"
+        # claim is withdrawn -- those 6 tunnels were 6 separate browsers with 6
+        # separate --user-data-dirs, i.e. six distinct storage identities, and
+        # they still collapsed.
+        #
+        # Scale by adding EXITS (more runners at 1 tunnel), not tunnels. Verify
+        # per exit at https://mohanadino.duckdns.org:8443/stats/exits, which
+        # scores each minting IP against icebot's real join verdicts.
+        description: "Browsers per runner. WARP's v4 is anycast so these SHARE one exit -- above 1 you are just overdriving it."
+        required: false
+        default: "1"
+      egress:
+        # WHY THIS EXISTS. Measured 2026-07-29 with per-exit attribution: tokens
+        # minted on a GitHub runner through WARP are accepted at ~4-5%, while the
+        # Oracle VM's tokens — same producer stack, same browser, same rates, also
+        # through WARP — are accepted at 100% in the same minutes. A single runner
+        # is no better than a fleet (1 joined / 22 refused), and mint rate makes no
+        # difference (per_min=10 and per_min=30 both collapse to 0%).
+        #
+        # The leading explanation is that WARP is Cloudflare's OWN product, so it
+        # cannot hide an untrusted origin from Cloudflare's own Turnstile: it
+        # restored *issuance* from AS8075 but not *standing* at siteverify. If that
+        # is right, no number of WARP runners will ever work and the egress has to
+        # be something Cloudflare does not operate.
+        #
+        #   warp     - control, the known-bad ~4% baseline
+        #   vpngate  - free volunteer OpenVPN relays, many RESIDENTIAL (JP/KR).
+        #              Changes the DEFAULT ROUTE, so no --proxy-server is used and
+        #              the relay POST egresses through it too (attribution still
+        #              sees the true exit). vpngate.py --index/--stride give N
+        #              runners DISJOINT relays instead of all picking the fastest.
+        #   webshare - our paid proxies. Diagnostic only: at ~0.75 MB/token, 800
+        #              tok/min would be ~25 TB/month, so this can prove the point
+        #              but cannot be the production answer.
+        #   direct   - control. Expect 600010 (Cloudflare refuses to challenge
+        #              AS8075 directly); confirms the runner itself is the problem.
+        description: "warp | vpngate | webshare | direct"
+        required: false
+        default: "warp"
+      vpngate_index:
+        # Job K of N passes index=K stride=N so concurrent runners take disjoint
+        # relays. Without it every runner ranks the feed identically, all pick the
+        # same top relay, and they collide on ONE exit — the exact failure that
+        # caps WARP's horizontal scale.
+        description: "VPN Gate: this job's slice index (0-based)"
+        required: false
+        default: "0"
+      vpngate_stride:
+        description: "VPN Gate: total number of concurrent jobs sharing the feed"
+        required: false
+        default: "1"
+      webshare_proxy:
+        # One entry, `host:port:user:pass` (the format of the proxy list files).
+        description: "webshare egress: host:port:user:pass"
+        required: false
+        default: ""
+      browser:
+        # cft136 mints ZERO with no `cf err` at all -- the challenge neither
+        # errors nor solves, which is not the AS8075 signature (that is loud
+        # 600010). Turnstile is known to weigh browser build age, and 136 is
+        # far behind the VM's Chromium 148 that mints fine. `playwright` gets a
+        # CURRENT Chromium, which unlike branded Chrome still honours
+        # --load-extension when the feature flag is turned off.
+        description: "playwright (modern Chromium, recommended) or cft136 (old, native --load-extension)"
+        required: false
+        default: "playwright"
+
+jobs:
+  produce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 358
+
+    env:
+      AUTH_SECRET: '74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434'
+      SITEKEY: '0x4AAAAAABBPKaIbNwnPEfSo'
+      RELAY: 'https://mohanadino.duckdns.org:8443/add'
+      SOCKS_PORT: '25344'
+
+    steps:
+      - name: 1. Runner facts (before any tunnel)
+        run: |
+          echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
+          echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+          google-chrome --version || true
+          chromium --version || true
+
+      - name: 2. Install Xvfb + a browser that still honours --load-extension
+        env:
+          BROWSER: ${{ github.event.inputs.browser }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # xdotool drives the pointer through XTEST. Every runner challenge
+          # escalates to interactive mode and then waits forever for a click
+          # nobody makes -- see step 6's click driver.
+          sudo apt-get install -y --no-install-recommends xvfb unzip xdotool
+
+          if [ "${BROWSER:-playwright}" = "playwright" ]; then
+            # A CURRENT Chromium. Branded Chrome removed --load-extension in
+            # M137 outright, but Chromium only gates it behind a feature flag,
+            # which step 6 turns off. Playwright is used purely as a download
+            # channel here -- the browser is launched by us, with no CDP and no
+            # driver attached, which is the whole point of this recipe.
+            npx --yes playwright@latest install --with-deps chromium >/dev/null 2>&1 || \
+              npx --yes playwright@latest install chromium
+            BIN=$(find "$HOME/.cache/ms-playwright" -type f -name chrome -path '*chrome-linux*' | head -1)
+            [ -n "$BIN" ] || { echo 'playwright chromium not found' >&2; exit 1; }
+            echo "CHROME_BIN=$BIN" >> "$GITHUB_ENV"
+            "$BIN" --version
+            exit 0
+          fi
+
+          # The runner's preinstalled Chrome is 150. Chrome REMOVED
+          # --load-extension in M137 (and the
+          # --disable-features=DisableLoadExtensionCommandLineSwitch escape
+          # hatch with it), so on the stock browser the extension silently never
+          # runs -- which is exactly how this failed on the first attempt.
+          # Chrome for Testing 136 is the last line that still loads it, and
+          # pinning is the same discipline the Camoufox v135 pin exists for.
+          #
+          # NOT the apt `chromium` package: on 24.04 that is a snap wrapper
+          # whose confinement cannot read /tmp/ext.
+          VER=$(curl -fsSL --retry 3 https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json \
+            | jq -r '[.versions[]
+                      | select((.version | split(".")[0] | tonumber) == 136)
+                      | select(any(.downloads.chrome[]?; .platform == "linux64"))
+                      | .version] | last')
+          [ -n "$VER" ] && [ "$VER" != "null" ] || { echo 'no Chrome-for-Testing 136 build found' >&2; exit 1; }
+          echo "pinning Chrome for Testing $VER"
+          curl -fsSL --retry 3 -o /tmp/cft.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/$VER/linux64/chrome-linux64.zip"
+          sudo unzip -q /tmp/cft.zip -d /opt
+          sudo chmod -R a+rX /opt/chrome-linux64
+          echo "CHROME_BIN=/opt/chrome-linux64/chrome" >> "$GITHUB_ENV"
+          /opt/chrome-linux64/chrome --version
+
+      - name: 3. Bring up N Cloudflare WARP tunnels, one exit IP each
+        env:
+          FORBID: ${{ github.event.inputs.forbid_exits }}
+          TUNNELS: ${{ github.event.inputs.tunnels }}
+          WARP_IDENTITY_B64: ${{ github.event.inputs.warp_identity }}
+          EGRESS: ${{ github.event.inputs.egress }}
+          VPNGATE_INDEX: ${{ github.event.inputs.vpngate_index }}
+          VPNGATE_STRIDE: ${{ github.event.inputs.vpngate_stride }}
+          WEBSHARE_PROXY: ${{ github.event.inputs.webshare_proxy }}
+        run: |
+          # `set +e` explicitly: GitHub invokes every step as `bash -e {0}` and
+          # `set -uo pipefail` does NOT clear that. One tunnel failing to
+          # register must not kill a job that can still run on the others --
+          # without this the failing warp_up.sh subshell aborts the step before
+          # the "continuing with fewer" branch can even report why. Only zero
+          # tunnels is fatal: falling through to the runner's own AS8075 egress
+          # would mint nothing but 600010 for hours.
+          set +e +o pipefail
+          TUNNELS="${TUNNELS:-3}"
+          EGRESS="${EGRESS:-warp}"
+          : > /tmp/tunnels.txt
+
+          # tunnels.txt is `n <proxy-url-or-dash> <exit-v4> <label>`. Field 2 is a
+          # FULL proxy URL now (it used to be a bare SOCKS port), because vpngate
+          # and direct take no proxy at all and webshare needs credentials.
+          if [ "$EGRESS" != "warp" ]; then
+            case "$EGRESS" in
+              vpngate)
+                sudo apt-get install -y --no-install-recommends openvpn >/dev/null 2>&1
+                curl -fsSL -o /tmp/vpngate.csv https://www.vpngate.net/api/iphone/
+                echo 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJUdXJuIHRoZSBWUE4gR2F0ZSBwdWJsaWMgcmVsYXkgbGlzdCBpbnRvIHJlYWR5LXRvLXVzZSBPcGVuVlBOIGNvbmZpZ3MuCgpWUE4gR2F0ZSAodnBuZ2F0ZS5uZXQpIHB1Ymxpc2hlcyBhIENTViBvZiB2b2x1bnRlZXItcnVuIHJlbGF5cywgZWFjaCBjYXJyeWluZwppdHMgd2hvbGUgLm92cG4gY29uZmlnIGlubGluZSBhcyBiYXNlNjQg4oCUIG5vIGFjY291bnQsIG5vIGNyZWRlbnRpYWxzLCBubyBBUEkKa2V5LiBNYW55IGV4aXRzIGFyZSByZXNpZGVudGlhbCBjb25zdW1lciBsaW5lcyAobW9zdGx5IEpQL0tSKSwgd2hpY2ggaXMgdGhlCnByb3BlcnR5IHRoYXQgYWN0dWFsbHkgbWF0dGVycyBoZXJlOiB0aGUgcGlwZWxpbmUgaGFzIG1lYXN1cmVkIHRoYXQgcmVzaWRlbnRpYWwKZXhpdHMgdG9sZXJhdGUgc29sdmUgcmF0ZXMgdGhhdCBjb2xsYXBzZSBhIGRhdGFjZW50ZXIgSVAuCgpgYC0taW5kZXhgYC9gYC0tc3RyaWRlYGAgZXhpc3Qgc28gTiBjb25jdXJyZW50IHByb2R1Y2VycyBwaWNrICoqZGlzam9pbnQqKgpyZWxheXMuIFdpdGhvdXQgdGhlbSBldmVyeSBydW5uZXIgcmFua3MgdGhlIGZlZWQgaWRlbnRpY2FsbHksIGFsbCBwaWNrIHRoZSBzYW1lCnRvcCByZWxheSwgYW5kIHRoZXkgY29sbGlkZSBvbiBvbmUgZXhpdCBJUCDigJQgdGhlIGV4YWN0IGZhaWx1cmUgdGhhdCBjYXBzIFdBUlAncwpob3Jpem9udGFsIHNjYWxlLiBKb2IgSyBvZiBOIHBhc3NlcyBgYC0taW5kZXggSyAtLXN0cmlkZSBOYGAgYW5kIHJlY2VpdmVzIHJhbmtzCkssIEsrTiwgSysyTiwg4oCmOiBkaXNqb2ludCBzZXRzLCBlYWNoIHdpdGggYSBmYWlyIHNwcmVhZCBvZiBxdWFsaXR5IHJhdGhlciB0aGFuCm9uZSBqb2IgaG9nZ2luZyBldmVyeSBmYXN0IHJlbGF5LgoKVXNhZ2U6IHZwbmdhdGUucHkgPGNzdj4gPG91dGRpcj4gWy0tY291bnQgTl0gWy0taW5kZXggS10gWy0tc3RyaWRlIFNdCldyaXRlcyA8b3V0ZGlyPi8wMC08Y291bnRyeT4tPGhvc3Q+Lm92cG4g4oCmIGJlc3QgY2FuZGlkYXRlIGZvciB0aGlzIGpvYiBmaXJzdC4KIiIiCgpmcm9tIF9fZnV0dXJlX18gaW1wb3J0IGFubm90YXRpb25zCgppbXBvcnQgYXJncGFyc2UKaW1wb3J0IGJhc2U2NAppbXBvcnQgY3N2CmltcG9ydCBpbwppbXBvcnQgc3lzCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAoKCmRlZiBwYXJzZV9mZWVkKHJhdzogc3RyKSAtPiBsaXN0W3R1cGxlW2ludCwgaW50LCBzdHIsIHN0ciwgc3RyXV06CiAgICAiIiJSYW5rIHVzYWJsZSByZWxheXMgYmVzdC1maXJzdCBhcyAoc3BlZWQsIC1waW5nLCBjb3VudHJ5LCBob3N0LCBjb25maWcpLiIiIgogICAgIyBUaGUgZmVlZCBpcyB3cmFwcGVkIGluICp2cG5fc2VydmVycyAvICogbWFya2VycyBhbmQgaGFzIGEgY29tbWVudGVkIGhlYWRlci4KICAgIGxpbmVzID0gW2xuIGZvciBsbiBpbiByYXcuc3BsaXRsaW5lcygpIGlmIGxuIGFuZCBub3QgbG4uc3RhcnRzd2l0aCgiKiIpXQogICAgaWYgbGluZXMgYW5kIGxpbmVzWzBdLnN0YXJ0c3dpdGgoIiMiKToKICAgICAgICBsaW5lc1swXSA9IGxpbmVzWzBdLmxzdHJpcCgiIyIpCgogICAgY2FuZGlkYXRlcyA9IFtdCiAgICBmb3Igcm93IGluIGNzdi5EaWN0UmVhZGVyKGlvLlN0cmluZ0lPKCJcbiIuam9pbihsaW5lcykpKToKICAgICAgICBlbmNvZGVkID0gKHJvdy5nZXQoIk9wZW5WUE5fQ29uZmlnRGF0YV9CYXNlNjQiKSBvciAiIikuc3RyaXAoKQogICAgICAgIGlmIG5vdCBlbmNvZGVkOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIHRyeToKICAgICAgICAgICAgY29uZmlnID0gYmFzZTY0LmI2NGRlY29kZShlbmNvZGVkKS5kZWNvZGUoInV0Zi04IiwgInJlcGxhY2UiKQogICAgICAgICAgICBzcGVlZCA9IGludChyb3cuZ2V0KCJTcGVlZCIpIG9yIDApCiAgICAgICAgICAgIHBpbmcgPSBpbnQocm93LmdldCgiUGluZyIpIG9yIDk5OTkpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgY29udGludWUKICAgICAgICAjIFJhbmsgYnkgdGhyb3VnaHB1dDogYSBzbG93IHJlbGF5IGp1c3QgdGltZXMgdGhlIHdob2xlIHJ1biBvdXQuCiAgICAgICAgY2FuZGlkYXRlcy5hcHBlbmQoKHNwZWVkLCAtcGluZywgcm93LmdldCgiQ291bnRyeVNob3J0IiwgIj8/IiksCiAgICAgICAgICAgICAgICAgICAgICAgICAgIHJvdy5nZXQoIiNIb3N0TmFtZSIpIG9yIHJvdy5nZXQoIkhvc3ROYW1lIikgb3IgImgiLAogICAgICAgICAgICAgICAgICAgICAgICAgICBjb25maWcpKQogICAgY2FuZGlkYXRlcy5zb3J0KHJldmVyc2U9VHJ1ZSkKICAgIHJldHVybiBjYW5kaWRhdGVzCgoKZGVmIG1haW4oKSAtPiBpbnQ6CiAgICBwYXJzZXIgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihkZXNjcmlwdGlvbj1fX2RvY19fKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgiY3N2IiwgdHlwZT1QYXRoKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgib3V0ZGlyIiwgdHlwZT1QYXRoKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgiLS1jb3VudCIsIHR5cGU9aW50LCBkZWZhdWx0PTYsCiAgICAgICAgICAgICAgICAgICAgICAgIGhlbHA9ImhvdyBtYW55IGNhbmRpZGF0ZXMgdG8gd3JpdGUgKGZhbGxiYWNrcyBpbmNsdWRlZCkiKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgiLS1pbmRleCIsIHR5cGU9aW50LCBkZWZhdWx0PTEsCiAgICAgICAgICAgICAgICAgICAgICAgIGhlbHA9IjEtYmFzZWQgaW5kZXggb2YgdGhpcyBwcm9kdWNlciBhbW9uZyAtLXN0cmlkZSBwZWVycyIpCiAgICBwYXJzZXIuYWRkX2FyZ3VtZW50KCItLXN0cmlkZSIsIHR5cGU9aW50LCBkZWZhdWx0PTEsCiAgICAgICAgICAgICAgICAgICAgICAgIGhlbHA9InRvdGFsIG51bWJlciBvZiBjb25jdXJyZW50IHByb2R1Y2VycyIpCiAgICBhcmdzID0gcGFyc2VyLnBhcnNlX2FyZ3MoKQoKICAgIGlmIGFyZ3MuaW5kZXggPCAxIG9yIGFyZ3Muc3RyaWRlIDwgMSBvciBhcmdzLmluZGV4ID4gYXJncy5zdHJpZGU6CiAgICAgICAgcHJpbnQoIm5lZWQgMSA8PSBpbmRleCA8PSBzdHJpZGUiLCBmaWxlPXN5cy5zdGRlcnIpCiAgICAgICAgcmV0dXJuIDEKCiAgICBjYW5kaWRhdGVzID0gcGFyc2VfZmVlZChhcmdzLmNzdi5yZWFkX3RleHQoInV0Zi04IiwgInJlcGxhY2UiKSkKICAgIG1pbmUgPSBjYW5kaWRhdGVzW2FyZ3MuaW5kZXggLSAxOjphcmdzLnN0cmlkZV1bOmFyZ3MuY291bnRdCiAgICBpZiBub3QgbWluZToKICAgICAgICBwcmludCgibm8gdXNhYmxlIHJlbGF5cyBpbiBmZWVkIGZvciB0aGlzIGluZGV4IiwgZmlsZT1zeXMuc3RkZXJyKQogICAgICAgIHJldHVybiAxCgogICAgYXJncy5vdXRkaXIubWtkaXIocGFyZW50cz1UcnVlLCBleGlzdF9vaz1UcnVlKQogICAgZm9yIHJhbmssIChzcGVlZCwgbmVncGluZywgY291bnRyeSwgaG9zdCwgY29uZmlnKSBpbiBlbnVtZXJhdGUobWluZSk6CiAgICAgICAgcGF0aCA9IGFyZ3Mub3V0ZGlyIC8gZiJ7cmFuazowMmR9LXtjb3VudHJ5fS17aG9zdH0ub3ZwbiIKICAgICAgICAjIE5vbi1pbnRlcmFjdGl2ZTogT3BlblZQTiBtdXN0IG5ldmVyIGJsb2NrIGFza2luZyBmb3IgYSBjcmVkZW50aWFsLCBhbmQKICAgICAgICAjIGEgZGVhZCByZWxheSBtdXN0IGZhaWwgZmFzdCByYXRoZXIgdGhhbiByZXRyeSBmb3JldmVyLgogICAgICAgIHBhdGgud3JpdGVfdGV4dChjb25maWcgKyAnXG5hdXRoLW5vY2FjaGVcbnB1bGwtZmlsdGVyIGlnbm9yZSAiYXV0aC10b2tlbiJcbicsCiAgICAgICAgICAgICAgICAgICAgICAgICJ1dGYtOCIpCiAgICAgICAgcHJpbnQoZiJ7cGF0aC5uYW1lfSBzcGVlZD17c3BlZWQvMWU2Oi4xZn1NYnBzIHBpbmc9ey1uZWdwaW5nfW1zICIKICAgICAgICAgICAgICBmImNvdW50cnk9e2NvdW50cnl9IiwgZmlsZT1zeXMuc3RkZXJyKQoKICAgIHByaW50KGYicG9vbD17bGVuKGNhbmRpZGF0ZXMpfSBpbmRleD17YXJncy5pbmRleH0ve2FyZ3Muc3RyaWRlfSAiCiAgICAgICAgICBmIndyaXR0ZW49e2xlbihtaW5lKX0iLCBmaWxlPXN5cy5zdGRlcnIpCiAgICByZXR1cm4gMAoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICBzeXMuZXhpdChtYWluKCkpCg==' | base64 -d > /tmp/vpngate.py
+                mkdir -p /tmp/vpn
+                python3 /tmp/vpngate.py /tmp/vpngate.csv /tmp/vpn \
+                  --index "${VPNGATE_INDEX:-0}" --stride "${VPNGATE_STRIDE:-1}" || true
+                # A slice can come back empty (feed shorter than index*stride, or a
+                # bad fetch). Retry once unsliced rather than dying: an empty
+                # directory made `openvpn --config /tmp/vpn/*.ovpn` try to open the
+                # literal glob and fail the whole job.
+                if ! ls /tmp/vpn/*.ovpn >/dev/null 2>&1; then
+                  echo "slice ${VPNGATE_INDEX}/${VPNGATE_STRIDE} was empty — retrying unsliced"
+                  python3 /tmp/vpngate.py /tmp/vpngate.csv /tmp/vpn || true
+                fi
+                ls /tmp/vpn/*.ovpn >/dev/null 2>&1 || { echo "::error::vpngate produced no configs"; head -3 /tmp/vpngate.csv; exit 1; }
+                echo "relay candidates: $(ls /tmp/vpn/*.ovpn | wc -l)"
+                before=$(curl -4 -s --max-time 10 https://api.ipify.org)
+                echo "egress_before=$before"
+                ok=""
+                for cfg in /tmp/vpn/*.ovpn; do
+                  echo "--- trying $(basename "$cfg") ---"
+                  sudo openvpn --config "$cfg" --daemon --log /tmp/ovpn.log \
+                    --connect-timeout 15 --connect-retry-max 1 || continue
+                  for i in $(seq 1 20); do
+                    now=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+                    if [ -n "$now" ] && [ "$now" != "$before" ]; then ok="$now"; break; fi
+                    sleep 2
+                  done
+                  [ -n "$ok" ] && break
+                  sudo pkill openvpn; sleep 2
+                done
+                [ -n "$ok" ] || { echo "::error::no VPN Gate relay came up"; tail -20 /tmp/ovpn.log; exit 1; }
+                echo "vpn_egress=$ok"
+                curl -s --max-time 15 "https://ipinfo.io/${ok}/json" | tr -d '\n'; echo
+                # Default route IS the tunnel, so no --proxy-server.
+                echo "0 - $ok vpngate" >> /tmp/tunnels.txt
+                ;;
+              webshare)
+                IFS=':' read -r wh wp wu wpw <<< "$WEBSHARE_PROXY"
+                [ -n "$wh" ] || { echo "::error::webshare_proxy required"; exit 1; }
+                PURL="http://$wu:$wpw@$wh:$wp"
+                ip=$(curl -4 -s --max-time 20 --proxy "$PURL" https://api.ipify.org)
+                [ -n "$ip" ] || { echo "::error::webshare proxy unreachable"; exit 1; }
+                echo "webshare_egress=$ip"
+                echo "0 $PURL $ip webshare" >> /tmp/tunnels.txt
+                ;;
+              direct)
+                ip=$(curl -4 -s --max-time 15 https://api.ipify.org)
+                echo "direct_egress=$ip (expect Cloudflare 600010 on AS8075)"
+                echo "0 - $ip direct" >> /tmp/tunnels.txt
+                ;;
+              *) echo "::error::unknown egress $EGRESS"; exit 1 ;;
+            esac
+            UP=$(wc -l < /tmp/tunnels.txt)
+            echo "TUNNELS_UP=$UP" >> "$GITHUB_ENV"
+            echo "EXITIP=$(awk 'NR==1{print $3}' /tmp/tunnels.txt)" >> "$GITHUB_ENV"
+            echo "egress=$EGRESS up=$UP"
+            exit 0
+          fi
+
+          mkdir -p /tmp/warp && cd /tmp/warp
+          echo 'IyEvdXNyL2Jpbi9lbnYgYmFzaAojIEJyaW5nIHVwIENsb3VkZmxhcmUgV0FSUCBhcyBhIGxvY2FsIFNPQ0tTNSBsaXN0ZW5lciwgcmVwb3J0IHRoZSBleGl0LCBhbmQKIyByZWZ1c2UgdG8gaGFuZCBiYWNrIGEgdHVubmVsIHdob3NlIGV4aXQgY29sbGlkZXMgd2l0aCBvbmUgYWxyZWFkeSBpbiB1c2UuCiMKIyBTaGFyZWQgYnkgdGhlIGV4aXQtY2hhcmFjdGVyaXNhdGlvbiBwcm9iZSBhbmQgdGhlIHByb2R1Y3Rpb24gcHJvZHVjZXJzLCBzbyBhbGwKIyBvZiB0aGVtIGFyZSBndWFyYW50ZWVkIHRvIG1lYXN1cmUgdGhlIHNhbWUgdGhpbmcuCiMKIyBVc2FnZTogd2FycF91cC5zaCA8YmluZF9wb3J0PiBbZW5kcG9pbnRfaG9zdF0gW2VuZHBvaW50X3BvcnRdCiMKIyBFbnZpcm9ubWVudDoKIyAgIFdBUlBfRk9SQklEX0VYSVRTICBjb21tYS1zZXBhcmF0ZWQgZXhpdCBJUHMgb3IgSVAgcHJlZml4ZXMgdG8gcmVqZWN0LCBlLmcuCiMgICAgICAgICAgICAgICAgICAgICAgIjEwNC4yOC4xOTYuNzksMTA0LjI4LjIyMS4iIEEgcHJlZml4IGVuZGluZyBpbiAnLicKIyAgICAgICAgICAgICAgICAgICAgICBtYXRjaGVzIGJ5IHByZWZpeC4gT24gYSBtYXRjaCB0aGUgdHVubmVsIGlzIHRvcm4gZG93biBhbmQKIyAgICAgICAgICAgICAgICAgICAgICBhIEZSRVNIIHJlZ2lzdHJhdGlvbiBpcyBhdHRlbXB0ZWQuCiMgICBXQVJQX01BWF9ST0xMUyAgICAgaG93IG1hbnkgcmVnaXN0cmF0aW9ucyB0byB0cnkgYmVmb3JlIGdpdmluZyB1cCAoZGVmYXVsdCA0KQojICAgV0FSUF9JREVOVElUWSAgICAgIGJhc2U2NCBvZiBhIGNvbXBsZXRlIHdnY2YtcHJvZmlsZS5jb25mLiBXaGVuIHNldCwgdGhlCiMgICAgICAgICAgICAgICAgICAgICAgc2NyaXB0IFJFVVNFUyB0aGF0IHByZS1leGlzdGluZyBXQVJQIHJlZ2lzdHJhdGlvbiBpbnN0ZWFkCiMgICAgICAgICAgICAgICAgICAgICAgb2YgcmVnaXN0ZXJpbmcgYSBmcmVzaCBhbm9ueW1vdXMgb25lLiBTZWUgYmVsb3cuCiMKIyDilIDilIAgV0FSUF9JREVOVElUWTogd2h5IHJldXNpbmcgYSByZWdpc3RyYXRpb24gaXMgYSBoeXBvdGhlc2lzIHdvcnRoIHRlc3Rpbmcg4pSA4pSA4pSACiMgVGhlIE9yYWNsZSBWTSByZXVzZXMgT05FIGxvbmctbGl2ZWQgV0FSUCByZWdpc3RyYXRpb24gYW5kIGl0cyB0b2tlbnMgaGF2ZSBiZWVuCiMgYWNjZXB0ZWQgZm9yIGRheXM7IGV2ZXJ5IEdpdEh1YiBydW5uZXIgam9iIHJlZ2lzdGVycyBhIEZSRVNIIGFub255bW91cyBvbmUgYW5kCiMgaGFzIG5ldmVyIGhlbGQgYWNjZXB0YW5jZSBmb3IgbW9yZSB0aGFuIGFib3V0IGFuIGhvdXIuIElmIHN0YW5kaW5nIGFjY3J1ZXMgdG8KIyB0aGUgUkVHSVNUUkFUSU9OIHJhdGhlciB0aGFuIHRvIHRoZSBob3N0IG5ldHdvcmssIGhhbmRpbmcgYSBydW5uZXIgYW4gYWdlZAojIGlkZW50aXR5IHRyYW5zZmVycyBpdCwgYW5kIHRoYXQgaXMgdGhlIG9ubHkga25vd24gcGF0aCB0byBhIGxhcmdlIHRva2VuIHN1cHBseQojIHRoYXQgZG9lcyBub3QgcmVxdWlyZSBmaW5kaW5nIGRvemVucyBvZiBob3N0cy4KIwojIFR3byBoYXJkIGNvbnN0cmFpbnRzIG9uIHRoZSBjYWxsZXI6CiMgICAqIEEgV2lyZUd1YXJkIHBlZXIga2V5IHVzZWQgZnJvbSB0d28gZW5kcG9pbnRzIGF0IG9uY2UgRkxBUFMg4oCUIHRoZSBDbG91ZGZsYXJlCiMgICAgIHBlZXIga2VlcHMgcmUtcGlubmluZyB0byB3aGljaGV2ZXIgZW5kcG9pbnQgaGFuZHNob29rIGxhc3QsIGFuZCBib3RoIHNpZGVzCiMgICAgIGxvc2UgcGFja2V0cy4gVGhlIGlkZW50aXR5IHlvdSBpbmplY3QgTVVTVCBOT1QgYmUgbGl2ZSBhbnl3aGVyZSBlbHNlLgojICAgKiBSZS1yb2xsaW5nIGlzIG1lYW5pbmdsZXNzIHdpdGggYW4gaW5qZWN0ZWQgaWRlbnRpdHk6IGV2ZXJ5IHJvbGwgd291bGQKIyAgICAgcHJvZHVjZSB0aGUgc2FtZSBleGl0LiBNQVhfUk9MTFMgaXMgdGhlcmVmb3JlIGZvcmNlZCB0byAxLCBhbmQgYSBmb3JiaWRkZW4KIyAgICAgZXhpdCBiZWNvbWVzIGEgaGFyZCBmYWlsdXJlIHJhdGhlciB0aGFuIGEgcmUtcm9sbC4KIwojIFdoeSB0aGUgZm9yYmlkIGxpc3QgZXhpc3RzOiBUdXJuc3RpbGUgc29sdmUtcmF0ZSBpcyBjYXBwZWQgcGVyIGV4aXQgSVAsIG5vdCBwZXIKIyBtYWNoaW5lLiBUd28gcHJvZHVjZXJzIGJlaGluZCBvbmUgZXhpdCBpcyBtZWFzdXJhYmx5IGZhdGFsIOKAlCBvbmUgc3VzdGFpbnMgfjQ5CiMgdG9rL21pbiB3aGlsZSB0aGUgb3RoZXIgZ2V0cyBub3RoaW5nIGJ1dCBDbG91ZGZsYXJlIDMwMDAzMC4gVHdvIHJ1bm5lcnMgZHJhd2luZwojIHRoZSBzYW1lIGFueWNhc3QgZXhpdCBpcyBub3QgaHlwb3RoZXRpY2FsOyBpdCB3YXMgb2JzZXJ2ZWQuIFNvIGFueSBzZWNvbmQKIyBwcm9kdWNlciwgaW4gdGhpcyBsYW5lIG9yIGFub3RoZXIgKHRoZSBPcmFjbGUgVk0gbGFuZSBhbHNvIHVzZXMgV0FSUCksIG11c3QgYmUKIyB0b2xkIHdoaWNoIGV4aXRzIGFyZSB0YWtlbiBhbmQgZGVjbGluZSB0aGVtLgojCiMgUHJpbnRzIGBrZXk9dmFsdWVgIGxpbmVzIGFuZCBsZWF2ZXMgd2lyZXByb3h5IHJ1bm5pbmcgaW4gdGhlIGJhY2tncm91bmQuIEV4aXRzCiMgbm9uLXplcm8gaWYgbm8gYWNjZXB0YWJsZSB0dW5uZWwgY291bGQgYmUgZXN0YWJsaXNoZWQg4oCUIGNhbGxlcnMgTVVTVCB0cmVhdAojIHRoYXQgYXMgZmF0YWwsIGJlY2F1c2UgZmFsbGluZyB0aHJvdWdoIHRvIHRoZSBydW5uZXIncyBvd24gZWdyZXNzIG1lYW5zIG1pbnRpbmcKIyBmcm9tIEFTODA3NSwgd2hpY2ggeWllbGRzIG5vdGhpbmcgYnV0IENsb3VkZmxhcmUgNjAwMDEwLgpzZXQgLWV1byBwaXBlZmFpbAoKQklORF9QT1JUPSIkezE6P2JpbmQgcG9ydCByZXF1aXJlZH0iCkVORFBPSU5UX0hPU1Q9IiR7MjotfSIKRU5EUE9JTlRfUE9SVD0iJHszOi19IgpGT1JCSUQ9IiR7V0FSUF9GT1JCSURfRVhJVFM6LX0iCk1BWF9ST0xMUz0iJHtXQVJQX01BWF9ST0xMUzotNH0iCklERU5USVRZPSIke1dBUlBfSURFTlRJVFk6LX0iCiMgT25lIHJvbGwgb25seSB3aGVuIGFuIGlkZW50aXR5IGlzIGluamVjdGVkOiByZS1yb2xsaW5nIHdvdWxkIHJlLXJlZ2lzdGVyIGFuZAojIHRocm93IGF3YXkgdGhlIHZlcnkgdGhpbmcgdGhlIGNhbGxlciBpcyB0cnlpbmcgdG8gdGVzdC4KW1sgLW4gIiRJREVOVElUWSIgXV0gJiYgTUFYX1JPTExTPTEKCiMgVGhlIHJlbGVhc2UgQ0ROIDUwNHMgaW4gYnVyc3RzIHRoYXQgb3V0bGFzdCBhbnkgY3VybCAtLXJldHJ5IGJ1ZGdldC4KZGwoKSB7CiAgZm9yIGF0dGVtcHQgaW4gMSAyIDMgNCA1IDY7IGRvCiAgICBjdXJsIC1mc1NMIC0tcmV0cnkgMyAtLXJldHJ5LWRlbGF5IDMgLS1yZXRyeS1hbGwtZXJyb3JzIFwKICAgICAgLS1jb25uZWN0LXRpbWVvdXQgMjAgLW8gIiQyIiAiJDEiICYmIHJldHVybiAwCiAgICBlY2hvICJkb3dubG9hZCBhdHRlbXB0ICRhdHRlbXB0IGZvciAkMiBmYWlsZWQ7IGJhY2tpbmcgb2ZmIiA+JjIKICAgIHNsZWVwICQoKCBhdHRlbXB0ICogOCApKQogIGRvbmUKICByZXR1cm4gMQp9CgppZiBbWyAhIC14IC4vd2djZiBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9WaVJiMy93Z2NmL3JlbGVhc2VzL2Rvd25sb2FkL3YyLjIuMzIvd2djZl8yLjIuMzJfbGludXhfYW1kNjQgd2djZgogIGNobW9kICt4IHdnY2YKZmkKaWYgW1sgISAteCAuL3dpcmVwcm94eSBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9wdWZmZXJmZmlzaC93aXJlcHJveHkvcmVsZWFzZXMvZG93bmxvYWQvdjEuMS4zL3dpcmVwcm94eV9saW51eF9hbWQ2NC50YXIuZ3ogd2lyZXByb3h5LnRhci5negogIHRhciB4emYgd2lyZXByb3h5LnRhci5negpmaQoKIyBEb2VzICQxIG1hdGNoIGFueSBlbnRyeSBpbiB0aGUgY29tbWEtc2VwYXJhdGVkICRGT1JCSUQgbGlzdD8gQW4gZW50cnkgZW5kaW5nCiMgaW4gJy4nIGlzIHRyZWF0ZWQgYXMgYSBwcmVmaXggc28gYSB3aG9sZSAvMjQtaXNoIGJsb2NrIGNhbiBiZSByZXNlcnZlZC4KaXNfZm9yYmlkZGVuKCkgewogIGxvY2FsIGlwPSIkMSIgZW50cnkKICBbWyAteiAiJEZPUkJJRCIgXV0gJiYgcmV0dXJuIDEKICBsb2NhbCBJRlM9JywnCiAgZm9yIGVudHJ5IGluICRGT1JCSUQ7IGRvCiAgICBlbnRyeT0iJHtlbnRyeS8vIC99IgogICAgW1sgLXogIiRlbnRyeSIgXV0gJiYgY29udGludWUKICAgIGlmIFtbICIkZW50cnkiID09ICouIF1dOyB0aGVuCiAgICAgIFtbICIkaXAiID09ICIkZW50cnkiKiBdXSAmJiByZXR1cm4gMAogICAgZWxzZQogICAgICBbWyAiJGlwIiA9PSAiJGVudHJ5IiBdXSAmJiByZXR1cm4gMAogICAgZmkKICBkb25lCiAgcmV0dXJuIDEKfQoKZXhpdF9pcD0iIjsgY29sbz0iIjsgd2FycD0iIjsgbG9jPSIiOyByb2xsPTA7IHdwX3BpZD0iIgp3aGlsZSAoKCByb2xsIDwgTUFYX1JPTExTICkpOyBkbwogIHJvbGw9JCgoIHJvbGwgKyAxICkpCiAgIyBLaWxsIG9ubHkgdGhlIHdpcmVwcm94eSBUSElTIGludm9jYXRpb24gc3RhcnRlZC4gSXQgdXNlZCB0byBiZQogICMgYHBraWxsIC1mICd3aXJlcHJveHkgLWMnYCwgd2hpY2gga2lsbGVkIGV2ZXJ5IHdpcmVwcm94eSBvbiB0aGUgYm94IC0tIGZpbmUKICAjIHdoZW4gb25lIHR1bm5lbCBleGlzdGVkLCBmYXRhbCBvbmNlIGEgY2FsbGVyIHJ1bnMgc2V2ZXJhbCBzaWRlIGJ5IHNpZGUgdG8KICAjIGdldCBzZXZlcmFsIGV4aXQgSVBzLCBiZWNhdXNlIGVhY2ggbmV3IHJvbGwgdG9yZSBkb3duIGl0cyBzaWJsaW5ncy4KICAjIGB8fCB0cnVlYCBpcyBsb2FkLWJlYXJpbmc6IHRoaXMgc2NyaXB0IHJ1bnMgdW5kZXIgYHNldCAtZWAsIGFuZCBraWxsaW5nIGEKICAjIHdpcmVwcm94eSB0aGF0IGhhcyBhbHJlYWR5IGRpZWQgcmV0dXJucyBub24temVybywgd2hpY2ggd291bGQgYWJvcnQgdGhlCiAgIyB3aG9sZSByb2xsIGxvb3AuIFRoZSBgcGtpbGwgLi4uIHx8IHRydWVgIHRoaXMgcmVwbGFjZWQgaGFkIHRoZSBzYW1lIGd1YXJkLgogIGlmIFtbIC1uICIkd3BfcGlkIiBdXTsgdGhlbiBraWxsICIkd3BfcGlkIiAyPi9kZXYvbnVsbCB8fCB0cnVlOyBmaQogIHdwX3BpZD0iIgogIHNsZWVwIDEKCiAgaWYgW1sgLW4gIiRJREVOVElUWSIgXV07IHRoZW4KICAgICMgSW5qZWN0ZWQgYWdlZCBpZGVudGl0eS4gd2djZiBpcyBuZXZlciBpbnZva2VkLCBzbyBubyBuZXcgcmVnaXN0cmF0aW9uIGlzCiAgICAjIGNyZWF0ZWQgYW5kIG5vdGhpbmcgaXMgZGVsZXRlZCDigJQgdGhlIHdob2xlIHBvaW50IGlzIHRoYXQgdGhpcyBkZXZpY2UKICAgICMgcmVjb3JkIGtlZXBzIGV4aXN0aW5nIGFjcm9zcyBydW5zIGFuZCBhY3Jvc3MgaG9zdHMuCiAgICBybSAtZiB3Z2NmLWFjY291bnQudG9tbCB3Z2NmLXByb2ZpbGUuY29uZgogICAgaWYgISBwcmludGYgJyVzJyAiJElERU5USVRZIiB8IGJhc2U2NCAtZCA+IHdnY2YtcHJvZmlsZS5jb25mIDI+L2Rldi9udWxsOyB0aGVuCiAgICAgIGVjaG8gIldBUlBfSURFTlRJVFkgaXMgbm90IHZhbGlkIGJhc2U2NCIgPiYyOyBleGl0IDEKICAgIGZpCiAgICBpZiAhIGdyZXAgLXEgJ15Qcml2YXRlS2V5JyB3Z2NmLXByb2ZpbGUuY29uZiB8fCAhIGdyZXAgLXEgJ15QdWJsaWNLZXknIHdnY2YtcHJvZmlsZS5jb25mOyB0aGVuCiAgICAgIGVjaG8gIldBUlBfSURFTlRJVFkgZGlkIG5vdCBkZWNvZGUgdG8gYSB3aXJlZ3VhcmQgcHJvZmlsZSIgPiYyOyBleGl0IDEKICAgIGZpCiAgICBlY2hvICJpZGVudGl0eT1pbmplY3RlZCIKICBlbHNlCiAgICAjIEEgZnJlc2ggYW5vbnltb3VzIHJlZ2lzdHJhdGlvbiBlYWNoIHJvbGw6IG5vIHNpZ251cCwgbm8gY3JlZGVudGlhbHMuIERlbGV0aW5nCiAgICAjIHRoZSBhY2NvdW50IGZpbGUgaXMgd2hhdCBtYWtlcyBpdCBmcmVzaCByYXRoZXIgdGhhbiByZXVzZWQuCiAgICBybSAtZiB3Z2NmLWFjY291bnQudG9tbCB3Z2NmLXByb2ZpbGUuY29uZgogICAgLi93Z2NmIHJlZ2lzdGVyIC0tYWNjZXB0LXRvcyA+L2Rldi9udWxsCiAgICAuL3dnY2YgZ2VuZXJhdGUgPi9kZXYvbnVsbAogICAgZWNobyAiaWRlbnRpdHk9ZnJlc2giCiAgZmkKCiAgY3Agd2djZi1wcm9maWxlLmNvbmYgd3AuY29uZgogIGlmIFtbIC1uICIkRU5EUE9JTlRfSE9TVCIgXV07IHRoZW4KICAgIHNlZCAtaSAic3xeRW5kcG9pbnQgKj0uKnxFbmRwb2ludCA9ICR7RU5EUE9JTlRfSE9TVH06JHtFTkRQT0lOVF9QT1JUOi0yNDA4fXwiIHdwLmNvbmYKICBmaQogIHByaW50ZiAnXG5bU29ja3M1XVxuQmluZEFkZHJlc3MgPSAxMjcuMC4wLjE6JXNcbicgIiRCSU5EX1BPUlQiID4+IHdwLmNvbmYKICAuL3dpcmVwcm94eSAtYyB3cC5jb25mID53aXJlcHJveHkubG9nIDI+JjEgJgogIHdwX3BpZD0kIQoKICBmb3IgXyBpbiAkKHNlcSAxIDMwKTsgZG8KICAgIGN1cmwgLXMgLS1tYXgtdGltZSA1IC0tc29ja3M1LWhvc3RuYW1lICIxMjcuMC4wLjE6JEJJTkRfUE9SVCIgXAogICAgICBodHRwczovL3d3dy5jbG91ZGZsYXJlLmNvbS9jZG4tY2dpL3RyYWNlID4vZGV2L251bGwgMj4mMSAmJiBicmVhawogICAgc2xlZXAgMgogIGRvbmUKCiAgdHJhY2U9JChjdXJsIC1zIC0tbWF4LXRpbWUgMjAgLS1zb2NrczUtaG9zdG5hbWUgIjEyNy4wLjAuMTokQklORF9QT1JUIiBcCiAgICBodHRwczovL3d3dy5jbG91ZGZsYXJlLmNvbS9jZG4tY2dpL3RyYWNlIHx8IHRydWUpCiAgZXhpdF9pcD0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL15pcD0vL3AnKQogIGNvbG89JChwcmludGYgJyVzJyAiJHRyYWNlIiB8IHNlZCAtbiAncy9eY29sbz0vL3AnKQogIHdhcnA9JChwcmludGYgJyVzJyAiJHRyYWNlIiB8IHNlZCAtbiAncy9ed2FycD0vL3AnKQogIGxvYz0kKHByaW50ZiAnJXMnICIkdHJhY2UiIHwgc2VkIC1uICdzL15sb2M9Ly9wJykKICAjIFdBUlAgaXMgZHVhbCBzdGFjayBhbmQgY2RuLWNnaS90cmFjZSByZXBvcnRzIHdoaWNoZXZlciBmYW1pbHkgdGhlIHJlcXVlc3QKICAjIHVzZWQg4oCUIG92ZXIgV0FSUCB0aGF0IGlzIElQdjYuIEJvdGggaGF2ZSB0byBiZSBjYXB0dXJlZDogdGhlIHY0IGFkZHJlc3MgaXMKICAjIHdoYXQgZWFybGllciBjb2xsaXNpb25zIHdlcmUgcmVjb3JkZWQgYXMsIGFuZCBlaXRoZXIgZmFtaWx5IGNhbiBiZSB0aGUgb25lCiAgIyBhIHBlZXIgbGFuZSBoYXMgYWxyZWFkeSBjbGFpbWVkLgogIGV4aXRfdjQ9JChjdXJsIC00IC1zIC0tbWF4LXRpbWUgMTUgLS1zb2NrczUtaG9zdG5hbWUgIjEyNy4wLjAuMTokQklORF9QT1JUIiBcCiAgICBodHRwczovL2FwaS5pcGlmeS5vcmcgfHwgdHJ1ZSkKICBlY2hvICJyb2xsPSRyb2xsIGV4aXRfaXA9JHtleGl0X2lwOi1GQUlMRUR9IGV4aXRfdjQ9JHtleGl0X3Y0Oi1ub25lfSBjb2xvPSR7Y29sbzotdW5rbm93bn0gd2FycD0ke3dhcnA6LXVua25vd259IgoKICBpZiBbWyAteiAiJGV4aXRfaXAiIHx8ICIkd2FycCIgIT0gIm9uIiBdXTsgdGhlbgogICAgZWNobyAiICB0dW5uZWwgZGlkIG5vdCBjb21lIHVwIG9uIHJvbGwgJHJvbGwiID4mMgogICAgY29udGludWUKICBmaQogIGlmIGlzX2ZvcmJpZGRlbiAiJGV4aXRfaXAiIHx8IHsgW1sgLW4gIiRleGl0X3Y0IiBdXSAmJiBpc19mb3JiaWRkZW4gIiRleGl0X3Y0IjsgfTsgdGhlbgogICAgaWYgW1sgLW4gIiRJREVOVElUWSIgXV07IHRoZW4KICAgICAgIyBObyByZS1yb2xsIGlzIHBvc3NpYmxlOiBhbiBpbmplY3RlZCBpZGVudGl0eSBhbHdheXMgbGFuZHMgb24gdGhlIHNhbWUKICAgICAgIyBleGl0LiBGYWlsIGxvdWRseSBpbnN0ZWFkIG9mIHNpbGVudGx5IGhhbmRpbmcgYmFjayBhIGZvcmJpZGRlbiB0dW5uZWwuCiAgICAgIGVjaG8gIiAgaW5qZWN0ZWQgaWRlbnRpdHkgZXhpdHMgb24gJHtleGl0X3Y0Oi0kZXhpdF9pcH0sIHdoaWNoIGlzIGZvcmJpZGRlbiDigJQgY2Fubm90IHJlLXJvbGwiID4mMgogICAgICBleGl0X2lwPSIiCiAgICAgIGJyZWFrCiAgICBmaQogICAgZWNobyAiICBleGl0ICR7ZXhpdF92NDotJGV4aXRfaXB9IGlzIGluIFdBUlBfRk9SQklEX0VYSVRTIOKAlCByZS1yb2xsaW5nIiA+JjIKICAgIGV4aXRfaXA9IiIKICAgIGNvbnRpbnVlCiAgZmkKICBicmVhawpkb25lCgplY2hvICJlbmRwb2ludF91c2VkPSQoZ3JlcCAtRSAnXkVuZHBvaW50JyB3cC5jb25mIHwgaGVhZCAtMSB8IHNlZCAncy8uKj0gKi8vJykiCmVjaG8gImV4aXRfaXA9JHtleGl0X2lwOi1GQUlMRUR9IgplY2hvICJleGl0X3Y0PSR7ZXhpdF92NDotbm9uZX0iCmVjaG8gImNvbG89JHtjb2xvOi11bmtub3dufSIKZWNobyAid2FycD0ke3dhcnA6LXVua25vd259IgplY2hvICJsb2M9JHtsb2M6LXVua25vd259IgplY2hvICJyb2xsc191c2VkPSRyb2xsIgoKaWYgW1sgLXogIiRleGl0X2lwIiB8fCAiJHdhcnAiICE9ICJvbiIgXV07IHRoZW4KICBlY2hvICJubyBhY2NlcHRhYmxlIFdBUlAgZXhpdCBhZnRlciAkcm9sbCByb2xscyAoZm9yYmlkPSckRk9SQklEJykiID4mMgogIHRhaWwgLTIwIHdpcmVwcm94eS5sb2cgPiYyIHx8IHRydWUKICBleGl0IDEKZmkK' | base64 -d > warp_up.sh
+          chmod +x warp_up.sh
+
+          # Claimed exits are deliberately NOT added to the forbid list. WARP's
+          # IPv4 is anycast and a runner pins to ONE: run 30347933726 rolled five
+          # fresh registrations and drew 104.28.196.79 every time, only the IPv6
+          # /64 varying, so a v4 forbid-list rejected every roll and gave 1
+          # tunnel of 3. (The "five runs, five exits" pattern that suggested
+          # otherwise was variance BETWEEN runners, not between registrations on
+          # one runner.)
+          #
+          # Whether tunnels sharing a v4 still scale is the open question this
+          # now measures: memory warp-netns-multiplies-token-exits recorded 3
+          # WARP lanes at 106.6 tok/min on the VM, while
+          # vm-chromium-producer/README.md asserts shared-exit lanes cannot
+          # multiply the ceiling. If the limit keys on the WARP registration
+          # (fresh every roll) they scale; if it keys on the v4 they will not --
+          # and the per-instance rates in [result] say which, instead of leaving
+          # it to inference.
+          CLAIMED="${FORBID:-}"
+          for n in $(seq 0 $(( TUNNELS - 1 ))); do
+            d=/tmp/warp/$n; mkdir -p "$d"; cp -f /tmp/warp/warp_up.sh "$d/"
+            # Reuse tunnel 0's downloads; the release CDN 504s in bursts and
+            # there is no reason to pull the same two binaries N times.
+            cp -f /tmp/warp/0/wgcf /tmp/warp/0/wireproxy "$d/" 2>/dev/null || true
+            port=$(( SOCKS_PORT + n ))
+            # Tunnel 0 only. One WireGuard key driven from two endpoints makes
+            # the Cloudflare peer re-pin to whichever handshook last, so handing
+            # the same identity to every tunnel would make them all flap.
+            ident=""
+            if [ "$n" = 0 ]; then ident="${WARP_IDENTITY_B64:-}"; fi
+            if [ -n "$ident" ] && [ "${TUNNELS:-1}" != 1 ]; then
+              echo "::warning::warp_identity is set but tunnels=$TUNNELS; only tunnel 0 gets the aged identity, the rest register fresh"
+            fi
+            ( cd "$d" && WARP_FORBID_EXITS="$CLAIMED" WARP_MAX_ROLLS=10 \
+                WARP_IDENTITY="$ident" ./warp_up.sh "$port" ) \
+              > "$d/out.txt" 2>&1
+            rc=$?
+            v4=$(sed -n 's/^exit_v4=//p' "$d/out.txt" | tail -1)
+            v6=$(sed -n 's/^exit_ip=//p'  "$d/out.txt" | tail -1)
+            colo=$(sed -n 's/^colo=//p'   "$d/out.txt" | tail -1)
+            if [ -n "$v4" ] && [ "$v4" != "none" ] && [ "$v4" != "FAILED" ]; then
+              echo "$n socks5://127.0.0.1:$port $v4 ${colo:-unknown}" >> /tmp/tunnels.txt
+              echo "tunnel $n  port=$port  exit=$v4  colo=${colo:-unknown}  v6=${v6:-none}"
+            else
+              echo "tunnel $n FAILED to register (rc=$rc) -- continuing with fewer"
+              # Every roll line, so a failure says whether it was collisions with
+              # the forbid list or registration flakiness.
+              grep -aE '^roll=|^rolls_used=|^exit_|forbid|did not come up' "$d/out.txt" | tail -14
+            fi
+          done
+
+          UP=$(wc -l < /tmp/tunnels.txt)
+          echo "tunnels_up=$UP of $TUNNELS"
+          [ "$UP" -ge 1 ] || { echo "::error::no WARP tunnel came up"; exit 1; }
+          echo "TUNNELS_UP=$UP" >> "$GITHUB_ENV"
+          echo "EXITIP=$(awk 'NR==1{print $3}' /tmp/tunnels.txt)" >> "$GITHUB_ENV"
+
+      - name: 4a. Go toolchain (joinverify needs >= the version in its go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: 4. Build the join verifier
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/jv && cd /tmp/jv
+          echo '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' | base64 -d | tar xzf -
+          go build -o /tmp/joinverify .
+          # A verifier that cannot answer REJECTED for an obviously bogus token
+          # is measuring itself, not gartic.
+          SELFPX=$(awk 'NR==1{print $2}' /tmp/tunnels.txt)
+          if [ "$SELFPX" = "-" ] || [ -z "$SELFPX" ]; then
+            /tmp/joinverify '1.AAAAAAAAAAAA.BBBBBBBB' \
+              | sed 's/^/selftest(bogus token, expect REJECTED code=5): /'
+          else
+            /tmp/joinverify -proxy "$SELFPX" '1.AAAAAAAAAAAA.BBBBBBBB' \
+              | sed 's/^/selftest(bogus token, expect REJECTED code=5): /'
+          fi
+
+      - name: 5. Write the MV3 extension
+        env:
+          LANES: ${{ github.event.inputs.lanes }}
+          PER_MIN: ${{ github.event.inputs.per_min }}
+          POST_TO_RELAY: ${{ github.event.inputs.post_to_relay }}
+          STRIP_DOM: ${{ github.event.inputs.strip_dom }}
+          ROTATE_FP: ${{ github.event.inputs.rotate_fp }}
+          RECYCLE_MIN: ${{ github.event.inputs.recycle_min }}
+          APPEARANCE: ${{ github.event.inputs.appearance }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ext
+          cat > /tmp/ext/manifest.json <<'MANIFEST'
+          {
+            "manifest_version": 3,
+            "name": "gartic token producer",
+            "version": "1.0",
+            "host_permissions": ["https://gartic.io/*", "https://mohanadino.duckdns.org/*"],
+            "content_scripts": [{
+              "matches": ["https://gartic.io/*"],
+              "js": ["producer.js"],
+              "run_at": "document_idle",
+              "world": "MAIN"
+            }]
+          }
+          MANIFEST
+
+          # Runner variant of tunnel system/vm-chromium-producer/producer.js.
+          # Two differences from the VM copy:
+          #
+          #   1. It emits the FULL token on a `TOKFULL` line so the job can
+          #      verify acceptance. That line goes to the Chrome log file, which
+          #      is never printed or uploaded -- the repo is public.
+          #   2. It emits `CLICKAT lane=<i> x=<sx> y=<sy>` in SCREEN coordinates
+          #      for any lane that is on screen and still unsolved, so step 6's
+          #      xdotool driver can click the checkbox. On the runner every
+          #      challenge escalates to interactive mode (BEFORE_INTERACTIVE on
+          #      every build, AFTER_INTERACTIVE never, no `cf err`, no token,
+          #      across three different WARP exits in three colos) -- the widget
+          #      is not failing, it is waiting for a click. The VM never needed
+          #      this because most of its challenges never escalate.
+          #
+          # Lanes are 320px apart, not 180: an interaction-only widget is ~300px
+          # wide once it becomes visible, so the old spacing made them overlap
+          # and put lane 1's checkbox underneath lane 0.
+          cat > /tmp/ext/producer.js <<'PRODUCER'
+          (function () {
+            'use strict';
+            var RELAY  = '__RELAY__';
+            var SECRET = '__SECRET__';
+            var KEY    = '__SITEKEY__';
+            var LANES  = __LANES__;
+            var PER_MIN = __PER_MIN__;
+            var POST = __POST__;
+            var STRIP = __STRIP__;
+            var ROTATE_FP = __ROTATE__;
+            var RECYCLE_MIN = __RECYCLE__;
+            var APPEARANCE = '__APPEARANCE__';
+            var LABEL = '__LABEL__';
+            var GAP = Math.round(60000 / PER_MIN);
+            var nextAllowed = 0, minted = 0, posted = 0;
+
+            function log(){ console.log.apply(console, ['[producer]'].concat([].slice.call(arguments))); }
+
+            // The POST goes through this browser's WARP tunnel, so the relay
+            // sees the minting exit as the TCP peer and scores that exit
+            // against icebot's real join verdicts (/stats/exits). LABEL is
+            // only a convenience for mapping an exit back to a run -- the relay
+            // never keys on it, because a producer could choose it.
+            function post(tok) {
+              if (!POST) { posted++; return; }
+              fetch(RELAY, { method:'POST',
+                headers:{'Content-Type':'application/json','X-Auth':SECRET},
+                body: JSON.stringify({token: tok, label: LABEL})
+              }).then(function(r){ if(r.ok){posted++;} log('posted', r.status, 'minted='+minted, 'posted='+posted); })
+                .catch(function(e){ log('relay error', e && e.message); });
+            }
+
+            // Viewport point -> X11 screen point. outerHeight-innerHeight is the
+            // browser chrome above the page; the horizontal term splits any
+            // window border evenly. Self-correcting, so the window can sit
+            // anywhere without the click driver needing to know where.
+            //
+            // devicePixelRatio is NOT optional: getBoundingClientRect() and
+            // screenX are CSS pixels, while xdotool/XTEST address DEVICE pixels.
+            // On a 175%-scaled display this error put the click ~1000px off the
+            // widget -- which looks exactly like Cloudflare refusing us, the
+            // same silent-failure shape that has already caused two multi-day
+            // misdiagnoses here. Xvfb runs at 1x so the runner never saw it.
+            function toScreen(r) {
+              var dpr = window.devicePixelRatio || 1;
+              var padX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+              var padY = Math.max(0, window.outerHeight - window.innerHeight);
+              return { x: Math.round(((window.screenX || 0) + padX + r.left) * dpr),
+                       y: Math.round(((window.screenY || 0) + padY + r.top) * dpr),
+                       dpr: dpr };
+            }
+
+            function lane(i) {
+              // ── 2026-07-29 FORK-BOMB FIX. Do not remove the generation guard.
+              // recycle() used to be non-idempotent and unconditionally scheduled
+              // a fresh build(). FIVE callbacks can fire for the SAME widget
+              // generation (error-callback, timeout-callback, the poll
+              // stuck-branch, the poll success-branch, build()'s own catch) and a
+              // hung widget fires several at once -- so one lane forked into two
+              // build chains, each installing its own callbacks and forking
+              // again. `slot`/`id` are per-lane closures shared by every fork, so
+              // removeChild() only dropped the newest div (every fork leaked a
+              // live widget + iframe + renderer forever) and getResponse(id) only
+              // read the newest fork, so MINTING STOPPED DEAD while thousands of
+              // widgets churned. Measured on the VM: prod_* count 2 -> 2,577
+              // still climbing ~1.2/sec, `minted` frozen 39 minutes, then a
+              // cgroup OOM -- all while the process was alive at 57% CPU.
+              // A generation counter makes every stale callback a no-op, so
+              // exactly one rebuild follows each recycle.
+              var gen = 0;
+              var CAP = LANES * 3;              // hard ceiling on live widgets
+              var slot, id, sawInter;
+              function purge(sel) {
+                var olds = document.querySelectorAll(sel);
+                for (var k = 0; k < olds.length; k++) {
+                  var wid = olds[k].getAttribute('data-wid');
+                  if (wid) { try { window.turnstile.remove(wid); } catch (e) {} }
+                  if (olds[k].parentNode) olds[k].parentNode.removeChild(olds[k]);
+                }
+                return olds.length;
+              }
+              function mine() { return 'div[id^="prod_' + i + '_"]'; }
+              function build() {
+                var myGen = gen;
+                sawInter = false;
+                purge(mine());
+                var live = document.querySelectorAll('div[id^="prod_"]').length;
+                if (live >= CAP) {
+                  log('FORKBOMB cap=' + CAP + ' live=' + live + ' lane=' + i +
+                      ' -- purging every lane and rebuilding');
+                  purge('div[id^="prod_"]');
+                }
+                slot = document.createElement('div');
+                slot.id = 'prod_' + i + '_' + myGen;
+                // The class off-the-shelf Turnstile helpers look for. Our own
+                // driver finds the widget by rect and does not need it, but a
+                // bench measured stock helpers at 3/3 on a classed widget and
+                // 0/2 on a bare div -- so this one line keeps any future
+                // clicker (SeleniumBase's, or a CDP one) able to find us.
+                slot.className = 'cf-turnstile';
+                slot.style.cssText = 'position:fixed;left:' + (10 + i*320) + 'px;bottom:10px;z-index:2147483647';
+                document.body.appendChild(slot);
+                try {
+                  id = window.turnstile.render(slot, {
+                    sitekey: KEY, action: 'join', appearance: APPEARANCE,
+                    callback: function(){},
+                    'error-callback': function(c){ log('cf err', c); defer(myGen, 2000); },
+                    'before-interactive-callback': function(){ sawInter = true; log('BEFORE_INTERACTIVE (lane '+i+')'); },
+                    'after-interactive-callback': function(){ log('AFTER_INTERACTIVE (lane '+i+')'); },
+                    'timeout-callback': function(){ defer(myGen, 0); }
+                  });
+                  slot.setAttribute('data-wid', String(id));
+                } catch (e) { log('render threw', e && e.message); defer(myGen, 3000); return; }
+                poll(0, myGen);
+              }
+              function read() {
+                try { var t = window.turnstile.getResponse(id); if (t) return t; } catch(e){}
+                var el = slot && slot.querySelector('input[name="cf-turnstile-response"]');
+                return el && el.value ? el.value : null;
+              }
+              // Publish where this lane's checkbox is, in screen coordinates, so
+              // the xdotool driver can hit it. Deliberately NOT tied to
+              // before-interactive: a lane that is on screen and unsolved wants
+              // a click whichever callback did or did not fire.
+              function emitClick() {
+                if (!slot) return;
+                var r = slot.getBoundingClientRect();
+                if (r.width < 20 || r.height < 20) return;   // still collapsed
+                var p = toScreen(r);
+                // The checkbox sits at the left end of an expanded widget; on a
+                // small box aim at its centre instead.
+                var ox = r.width >= 200 ? 30 : Math.round(r.width / 2);
+                // Offsets are CSS pixels too, so they scale with the rest.
+                var cx = p.x + Math.round(ox * p.dpr),
+                    cy = p.y + Math.round((r.height / 2) * p.dpr);
+                // An off-screen window yields absurd screen coords (a bench log
+                // showed CLICKAT x=-18246 y=-17578). The pointer then lands
+                // nowhere, the widget is never clicked, and the run looks
+                // exactly like "Cloudflare refused us" -- a silent failure of
+                // precisely the kind that has already cost this project two
+                // multi-day misdiagnoses. Refuse to emit, and say why.
+                // screen.width/height are CSS pixels as well -- compare like
+                // with like, or the bounds check itself misfires on HiDPI.
+                var sw = Math.round(((window.screen && window.screen.width)  || 1280) * p.dpr);
+                var sh = Math.round(((window.screen && window.screen.height) || 900)  * p.dpr);
+                if (cx < 0 || cy < 0 || cx > sw || cy > sh) {
+                  log('CLICKOFFSCREEN lane=' + i + ' x=' + cx + ' y=' + cy +
+                      ' screen=' + sw + 'x' + sh + ' dpr=' + p.dpr +
+                      ' -- window is off-screen, not clicking');
+                  return;
+                }
+                log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy + ' dpr=' + p.dpr);
+              }
+              function poll(n, myGen) {
+                if (myGen !== gen) return;      // a stale chain must die, not recycle
+                var t = read();
+                if (t) {
+                  var now = Date.now();
+                  var wait = Math.max(0, nextAllowed - now);
+                  nextAllowed = Math.max(now, nextAllowed) + GAP;
+                  minted++;
+                  log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16), 'solve='+(sawInter?'int':'auto'));
+                  log('TOKFULL ' + (sawInter ? 'int' : 'auto') + ' ' + t);
+                  setTimeout(function(){ post(t); }, wait);
+                  defer(myGen, wait + 500);
+                  return;
+                }
+                if (n > 60) { defer(myGen, 0); return; }
+                if (n % 5 === 2) emitClick();
+                setTimeout(function(){ poll(n+1, myGen); }, 1000);
+              }
+              // defer()/recycle() are the ONLY route back to build().
+              // Do not add another caller -- that is exactly how this happened.
+              function defer(myGen, ms) {
+                if (myGen !== gen) return;
+                setTimeout(function(){ recycle(myGen); }, ms);
+              }
+              function recycle(myGen) {
+                if (myGen !== gen) return;      // someone already recycled this gen
+                gen++;                          // invalidates every pending callback
+                try { window.turnstile.remove(id); } catch(e){}
+                purge(mine());
+                slot = null; id = null;
+                setTimeout(build, 400);
+              }
+              return build;
+            }
+
+            // The old DIAG printed `iframes=0` for BOTH a minting VM and a dead
+            // runner, so it decided nothing -- a top-level
+            // `iframe[src*=challenges.cloudflare.com]` query misses an iframe
+            // that Turnstile put inside a descendant's shadow root. Report each
+            // lane's real size and iframe count, light DOM and shadow DOM, so a
+            // zero-mint run says whether the widget drew at all.
+            setInterval(function(){
+              var ifr = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"]').length;
+              var boxes = document.querySelectorAll('[id^="prod_"]');
+              var parts = [];
+              for (var b = 0; b < boxes.length; b++) {
+                var el = boxes[b], r = el.getBoundingClientRect();
+                var kids = el.querySelectorAll('*'), sr = 0;
+                for (var k = 0; k < kids.length; k++) {
+                  if (kids[k].shadowRoot) sr += kids[k].shadowRoot.querySelectorAll('iframe').length;
+                }
+                parts.push(el.id + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+                           ' ifr=' + el.querySelectorAll('iframe').length + ' srIfr=' + sr +
+                           ' resp=' + (el.querySelector('input[name="cf-turnstile-response"]') ? 1 : 0));
+              }
+              log('DIAG iframes=' + ifr + ' lanes=' + boxes.length + ' minted=' + minted +
+                  ' posted=' + posted + ' | ' + parts.join(' | '));
+            }, 20000);
+
+            // gartic's homepage is a heavy Next.js app that animates
+            // continuously, and on a runner the binding constraint is CPU: 3
+            // tunnels and 5 tunnels both total 27/min, with per-instance rate
+            // falling 9 -> 5 as instances are added. We need this origin (the
+            // siteverify hostname must be gartic.io) and its window.turnstile
+            // -- we do not need its UI. Dropping the DOM frees that CPU for
+            // solving. window.turnstile is already captured and lives on, and
+            // the lanes render into elements we create ourselves.
+            // Re-roll the two vectors Camoufox actually varies. Measured across
+            // 4 Camoufox launches: canvasHash 4/4 distinct, webglRenderer 4/4
+            // distinct, while userAgent/platform/timezone stayed constant.
+            // Noise is deliberately tiny -- flip the low bit of a handful of
+            // pixels -- so the canvas still renders correctly and only its hash
+            // moves. A heavy-handed spoof is itself a detection signal.
+            function rotateFingerprint() {
+              var seed = (Math.random() * 2147483647) | 0;
+              function rnd(n) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }
+
+              try {
+                var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                var origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+                function perturb(d) {
+                  var px = d.data.length >> 2;
+                  for (var k = 0; k < 8 && px > 0; k++) {
+                    var idx = rnd(px) << 2;
+                    d.data[idx] = d.data[idx] ^ 1;
+                  }
+                  return d;
+                }
+                CanvasRenderingContext2D.prototype.getImageData = function () {
+                  return perturb(origGetImageData.apply(this, arguments));
+                };
+                HTMLCanvasElement.prototype.toDataURL = function () {
+                  try {
+                    var c = this.getContext && this.getContext('2d');
+                    if (c && this.width && this.height) {
+                      c.putImageData(perturb(origGetImageData.call(c, 0, 0, this.width, this.height)), 0, 0);
+                    }
+                  } catch (e) {}
+                  return origToDataURL.apply(this, arguments);
+                };
+              } catch (e) { log('fp canvas patch failed', e && e.message); }
+
+              // 37445 = UNMASKED_VENDOR_WEBGL, 37446 = UNMASKED_RENDERER_WEBGL.
+              var GPUS = [
+                ['Google Inc. (Intel)',  'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)'],
+                ['Google Inc. (NVIDIA)', 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0, D3D11)'],
+                ['Google Inc. (AMD)',    'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)'],
+                ['Intel Inc.',           'Intel Iris OpenGL Engine']
+              ];
+              var gpu = GPUS[rnd(GPUS.length)];
+              try {
+                [window.WebGLRenderingContext, window.WebGL2RenderingContext].forEach(function (C) {
+                  if (!C || !C.prototype) return;
+                  var orig = C.prototype.getParameter;
+                  C.prototype.getParameter = function (p) {
+                    if (p === 37445) return gpu[0];
+                    if (p === 37446) return gpu[1];
+                    return orig.apply(this, arguments);
+                  };
+                });
+              } catch (e) { log('fp webgl patch failed', e && e.message); }
+
+              try {
+                var cores = [2, 4, 8, 12, 16][rnd(5)];
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: function () { return cores; } });
+              } catch (e) {}
+
+              log('FP rotated gpu=' + gpu[1].slice(0, 30));
+            }
+
+            function stripPage() {
+              try {
+                document.body.innerHTML = '';
+                document.body.style.cssText = 'background:#202020;margin:0';
+                if (document.title) document.title = 'p';
+                log('page stripped for CPU');
+              } catch (e) { log('strip failed', e && e.message); }
+            }
+
+            var waited = 0;
+            (function wait() {
+              if (window.turnstile && window.turnstile.render) {
+                log('turnstile present -- starting', LANES, 'lanes');
+                // Rotate BEFORE rendering any widget, or the challenge reads the
+                // real canvas/WebGL and the rotation buys nothing.
+                if (ROTATE_FP) rotateFingerprint();
+                if (STRIP) stripPage();
+                // A page reload re-runs this content script with a fresh seed,
+                // i.e. a fresh identity, without paying to restart Chromium.
+                if (RECYCLE_MIN > 0) {
+                  setTimeout(function () {
+                    log('RECYCLE reloading for a fresh identity');
+                    location.reload();
+                  }, RECYCLE_MIN * 60000);
+                }
+                for (var i = 0; i < LANES; i++) setTimeout(lane(i), i * 800);
+                return;
+              }
+              if ((waited += 250) > 60000) { log('window.turnstile NEVER appeared'); return; }
+              setTimeout(wait, 250);
+            })();
+          })();
+          PRODUCER
+
+          if [ "$POST_TO_RELAY" = "true" ]; then POSTJS=true; else POSTJS=false; fi
+          if [ "${STRIP_DOM:-true}" = "true" ]; then STRIPJS=true; else STRIPJS=false; fi
+          if [ "${ROTATE_FP:-false}" = "true" ]; then ROTJS=true; else ROTJS=false; fi
+          RECJS="${RECYCLE_MIN:-0}"
+          APPJS="${APPEARANCE:-interaction-only}"
+          LABELJS="gh-${GITHUB_RUN_ID:-unknown}"
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|; s|__LABEL__|$LABELJS|" /tmp/ext/producer.js
+          echo "rotate_fp=$ROTJS recycle_min=$RECJS"
+          grep -c . /tmp/ext/producer.js
+
+      - name: 6. Mint
+        timeout-minutes: 350
+        continue-on-error: true
+        env:
+          MINUTES: ${{ github.event.inputs.minutes }}
+          VERIFY_EVERY: ${{ github.event.inputs.verify_every }}
+          CLICK_STYLE: ${{ github.event.inputs.click_style }}
+          APPEARANCE: ${{ github.event.inputs.appearance }}
+        run: |
+          # GitHub invokes every step as `bash -e`, and `set -uo pipefail` does
+          # NOT clear that. A monitoring loop must not be fatal: `grep -c`
+          # exits 1 when the count is zero, so `MINTED=$(grep -ac ...)` killed
+          # this step 30s in, before the first token had been minted.
+          set +e +o pipefail
+          MINUTES="${MINUTES:-300}"
+          VERIFY_EVERY="${VERIFY_EVERY:-180}"
+          CLICK_STYLE="${CLICK_STYLE:-human}"
+          echo "click style: $CLICK_STYLE"
+          mapfile -t TUNS < /tmp/tunnels.txt
+          NINST=${#TUNS[@]}
+          echo "starting $NINST producer instance(s) -- one browser per exit IP"
+
+          # One Xvfb PER INSTANCE. Every browser then sits at 0,0 on its own
+          # display, so the CLICKAT screen coordinates are identical but never
+          # collide, and no window can occlude another instance's checkbox.
+          for t in "${TUNS[@]}"; do
+            set -- $t
+            Xvfb ":$(( 97 + $1 ))" -screen 0 1280x900x24 -ac -nolisten tcp >/dev/null 2>&1 &
+          done
+          sleep 4
+
+          # Plain browsers, no automation protocol. --proxy-server sends every
+          # request (including the relay POST) through that instance's WARP
+          # tunnel; Chromium resolves DNS remotely for socks5://, so nothing
+          # leaks to the runner resolver. DisableLoadExtensionCommandLineSwitch:
+          # Chrome >=137 ignores --load-extension without it.
+          IDX=(); PIDS=(); PORTS=(); LOGS=()
+          for t in "${TUNS[@]}"; do
+            set -- $t; n=$1; purl=$2; v4=$3; colo=$4
+            log="/tmp/chrome-$n.log"; : > "$log"; : > "/tmp/clicks-$n.log"
+            # vpngate and direct move the DEFAULT ROUTE, so they take no
+            # --proxy-server at all; warp and webshare pass a full proxy URL.
+            pxarg=()
+            [ "$purl" != "-" ] && pxarg=(--proxy-server="$purl")
+            DISPLAY=":$(( 97 + n ))" "$CHROME_BIN" \
+              --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
+              --disable-dev-shm-usage \
+              --user-data-dir="/tmp/chrome-profile-$n" \
+              --window-position=0,0 --window-size=1280,880 \
+              "${pxarg[@]}" \
+              --disable-features=DisableLoadExtensionCommandLineSwitch \
+              --disable-extensions-except=/tmp/ext \
+              --load-extension=/tmp/ext \
+              --enable-logging=stderr --v=0 \
+              "https://gartic.io/" >> "$log" 2>&1 &
+            IDX+=("$n"); PIDS+=($!); PORTS+=("$purl"); LOGS+=("$log")
+            echo "instance $n -> display :$(( 97 + n ))  proxy ${purl}  exit $v4 ($colo)"
+          done
+
+          # Fail loudly only if NO instance ran the extension -- that is a
+          # different bug from "the challenge did not solve", and conflating the
+          # two is what cost an earlier session its diagnosis.
+          for _ in $(seq 1 24); do
+            up=0
+            for l in "${LOGS[@]}"; do grep -aq '\[producer\]' "$l" && up=$(( up + 1 )); done
+            [ "$up" -eq "$NINST" ] && break
+            sleep 5
+          done
+          up=0; for l in "${LOGS[@]}"; do grep -aq '\[producer\]' "$l" && up=$(( up + 1 )); done
+          if [ "$up" -eq 0 ]; then
+            echo "::error::extension never executed -- --load-extension was ignored or the page never loaded"
+            echo "--- chrome version ---"; "$CHROME_BIN" --version
+            echo "--- last 40 log lines ---"; tail -40 "${LOGS[0]}"
+            exit 1
+          fi
+          echo "extension is running in $up/$NINST instance(s)"
+
+          # --- click driver, one per instance ----------------------------------
+          # Every challenge on a runner escalates to interactive mode and then
+          # waits for a click that a browser nobody is driving never makes.
+          # xdotool goes through XTEST, so Chromium receives genuine input
+          # (isTrusted=true) -- unlike a CDP-dispatched event, which is exactly
+          # what this whole no-automation-protocol recipe exists to avoid.
+          # Positions come from the extension's CLICKAT lines (screen coords),
+          # so nothing here has to guess where the widget is.
+          # A synthetic click is not automatically as good as a human one. The
+          # operator watched a hand click succeed on a widget where the machine
+          # click failed, so the pointer path itself may be scored. `simple` is
+          # the original 3-hop teleport, kept so the two can be A/B'd.
+          simple_click() {
+            local x="$1" y="$2"
+            xdotool mousemove --sync $(( x - 40 )) $(( y - 25 )) sleep 0.12 \
+                    mousemove --sync $(( x - 12 )) $(( y - 6 ))  sleep 0.09 \
+                    mousemove --sync "$x" "$y" sleep 0.18 click 1 >/dev/null 2>&1
+          }
+          human_click() {
+            local tx="$1" ty="$2" args hold
+            # Approach from a random angle and distance so no two clicks trace
+            # the same path; ease-in-out cubic, per-step jitter, and a slight
+            # overshoot that is then corrected -- humans do not land exactly.
+            # bash has no floats, so awk computes the path.
+            args=$(awk -v tx="$tx" -v ty="$ty" -v seed="$RANDOM$idx" '
+              BEGIN{
+                srand(seed); pi=3.14159265;
+                ang = rand()*360; dist = 80 + rand()*140; steps = 14 + int(rand()*8);
+                sx = tx + dist*cos(ang*pi/180); sy = ty + dist*sin(ang*pi/180);
+                # Keep the approach origin on-screen (Xvfb is 1280x900).
+                # xdotool clamps out-of-range coords, which would start the
+                # path pinned against a screen edge -- the opposite of subtle.
+                if (sx < 5) sx = 5; if (sx > 1275) sx = 1275;
+                if (sy < 5) sy = 5; if (sy > 895) sy = 895;
+                ox = tx + (rand()*8-4); oy = ty + (rand()*6-3);
+                for (i=1; i<=steps; i++) {
+                  t = i/steps;
+                  e = (t<0.5) ? 4*t*t*t : 1-((-2*t+2)^3)/2;
+                  printf "mousemove --sync %d %d sleep %.3f ",
+                         sx+(ox-sx)*e + (rand()*2.4-1.2),
+                         sy+(oy-sy)*e + (rand()*2.4-1.2),
+                         0.008+rand()*0.022;
+                }
+                printf "mousemove --sync %d %d sleep %.3f ", tx, ty, 0.09+rand()*0.14;
+              }')
+            # Humans hold the button ~60-140ms; xdotool `click` is about 12ms.
+            hold=$(awk -v s="$RANDOM" 'BEGIN{srand(s); printf "%.3f", 0.06+rand()*0.08}')
+            xdotool $args mousedown 1 >/dev/null 2>&1
+            sleep "$hold"
+            xdotool mouseup 1 >/dev/null 2>&1
+          }
+
+          click_driver() {
+            local idx="$1" log="/tmp/chrome-$1.log" last=0 total
+            export DISPLAY=":$(( 97 + idx ))"
+            while :; do
+              sleep 4
+              total=$(wc -c < "$log" 2>/dev/null || echo 0)
+              [ "${total:-0}" -le "$last" ] && continue
+              tail -c +$(( last + 1 )) "$log" 2>/dev/null \
+                | grep -ao 'CLICKAT lane=[0-9]* x=-\?[0-9]* y=-\?[0-9]*' \
+                | awk '{print $2, $3, $4}' | sed 's/[a-z]*=//g' | sort -u -k1,1 \
+                | while read -r ln x y; do
+                    [ -n "$x" ] && [ -n "$y" ] || continue
+                    if [ "$CLICK_STYLE" = "simple" ]; then
+                      simple_click "$x" "$y"
+                    else
+                      human_click "$x" "$y"
+                    fi
+                    echo "[click] inst=$idx lane=$ln at $x,$y" >> "/tmp/clicks-$idx.log"
+                  done
+              last=$total
+            done
+          }
+          # A self-solving widget must not be clicked -- interfering with a
+          # challenge that is already completing only breaks it.
+          CLICKERS=()
+          if [ "${APPEARANCE:-interaction-only}" = "interaction-only" ]; then
+            for n in "${IDX[@]}"; do click_driver "$n" & CLICKERS+=($!); done
+          else
+            echo "appearance=${APPEARANCE} -- click driver disabled (widget self-solves)"
+          fi
+
+          sum_over() {   # $1 = grep pattern, counted across every instance log
+            local s=0 c
+            for l in "${LOGS[@]}"; do c=$(grep -ac "$1" "$l" 2>/dev/null); s=$(( s + ${c:-0} )); done
+            echo "$s"
+          }
+
+          END=$(( $(date +%s) + MINUTES * 60 ))
+          verified=0; accepted=0; lastcheck=0; vturn=0
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 30
+            alive=0
+            for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && alive=$(( alive + 1 )); done
+            [ "$alive" -eq 0 ] && { echo "all chrome instances exited"; break; }
+
+            # grep -c always prints a number but exits 1 on no match, so a
+            # `|| echo 0` fallback would capture "0\n0" and break the arithmetic.
+            MINTED=$(sum_over 'TOKFULL ')
+            CLICKS=$(cat /tmp/clicks-*.log 2>/dev/null | grep -ac '^\[click\]'); CLICKS=${CLICKS:-0}
+            NOW=$(date +%s); EL=$(( NOW - (END - MINUTES*60) ))
+            RATE=$(( EL > 0 ? MINTED * 60 / EL : 0 ))
+            echo "[summary] t=${EL}s minted=$MINTED rate=${RATE}/min clicks=$CLICKS alive=$alive/$NINST accepted=$accepted/$verified"
+
+            # Verify one fresh token every ~3 min, ROTATING instances so every
+            # exit gets checked. Tokens are single-use, so a verified one is
+            # spent -- keep this sparse. Never print the token.
+            if [ $(( NOW - lastcheck )) -ge "$VERIFY_EVERY" ] && [ "$MINTED" -gt 0 ]; then
+              lastcheck=$NOW
+              vi=$(( vturn % NINST )); vturn=$(( vturn + 1 ))
+              vlog="${LOGS[$vi]}"; vport="${PORTS[$vi]}"; vn="${IDX[$vi]}"
+              # Chrome's console log appends `", source: <url> (line)` to EVERY
+              # line. The old extraction was `tr -d '"'`, which deletes the quote
+              # characters but leaves that suffix glued onto the token -- so the
+              # verifier was replaying a corrupted string, and a corrupted token
+              # can only ever come back code=5. Cut at the first quote instead:
+              # the token alphabet is base64url plus dots, so it never contains
+              # one. This is why a 143-token run reported accepted=0/4.
+              LINE=$(grep -a 'TOKFULL ' "$vlog" | tail -1 | sed 's/.*TOKFULL //' | sed 's/".*$//' | tr -d '\r')
+              FLAG=${LINE%% *}; TOK=${LINE#* }
+              if [ -n "$TOK" ] && [ "$TOK" != "$LINE" ]; then
+                # ⚠️ SAME-PATH BLIND -- this number is a MINT sanity check, not
+                # an acceptance measurement. Redeeming through the tunnel that
+                # minted the token means an exit being rate-limited for
+                # over-production still passes its own replay: on 2026-07-28
+                # this line printed 54/59 ACCEPTED while icebot, redeeming the
+                # same queue from Webshare proxies, was refused 100% code 5 and
+                # production was down.
+                # Real acceptance, per minting exit:
+                #   https://mohanadino.duckdns.org:8443/stats/exits
+                if [ "$vport" = "-" ]; then V=$(/tmp/joinverify "$TOK" 2>&1 | tail -1)
+                else V=$(/tmp/joinverify -proxy "$vport" "$TOK" 2>&1 | tail -1); fi
+                verified=$(( verified + 1 ))
+                case "$V" in JOINED*) accepted=$(( accepted + 1 ));; esac
+                # solve=int means this token came from a challenge that escalated
+                # to interactive and was clicked; solve=auto means it solved by
+                # itself.
+                echo "[verify] inst=$vn solve=$FLAG len=${#TOK} $V   (running $accepted/$verified ACCEPTED)"
+              fi
+            fi
+          done
+
+          for c in "${CLICKERS[@]}"; do kill "$c" 2>/dev/null; done
+          MINTED=$(sum_over 'TOKFULL ')
+          CLICKS=$(cat /tmp/clicks-*.log 2>/dev/null | grep -ac '^\[click\]'); CLICKS=${CLICKS:-0}
+          EL=$(( $(date +%s) - (END - MINUTES*60) )); [ "$EL" -lt 1 ] && EL=1
+          echo "=============================================="
+          echo "[result] instances=$NINST minted=$MINTED rate=$(( MINTED * 60 / EL ))/min clicks=$CLICKS same-path-replay=$accepted/$verified (NOT acceptance -- see /stats/exits)"
+          echo "=============================================="
+          echo "--- per instance ---"
+          for t in "${TUNS[@]}"; do
+            set -- $t; n=$1; v4=$3; colo=$4
+            m=$(grep -ac 'TOKFULL ' "/tmp/chrome-$n.log" 2>/dev/null); m=${m:-0}
+            echo "inst $n  exit=$v4 ($colo)  minted=$m  rate=$(( m * 60 / EL ))/min"
+          done
+          # If the per-instance rates hold up while this says 1, the ceiling
+          # keys on the WARP registration, not the exit address -- and shared-v4
+          # lanes are a legitimate way to scale one runner.
+          echo "distinct exit v4s: $(awk '{print $3}' /tmp/tunnels.txt | sort -u | wc -l) across $NINST instance(s)"
+          echo "--- interactive-mode callbacks ---"
+          for pat in BEFORE_INTERACTIVE AFTER_INTERACTIVE; do
+            echo "$pat: $(sum_over "$pat")"
+          done
+          echo "--- tokens by solve path ---"
+          for pat in int auto; do
+            echo "solve=$pat: $(sum_over "TOKFULL $pat ")"
+          done
+          cat "${LOGS[@]}" 2>/dev/null | grep -a 'cf err' | sed 's/.*cf err/cf err/' | sort | uniq -c | sort -rn | head
+          if [ "$MINTED" -eq 0 ]; then
+            # The producer's own console lines live in the chrome logs and were
+            # previously never surfaced, so a zero-mint run showed nothing to
+            # diagnose -- not even whether window.turnstile appeared. Dump them
+            # (never a TOKFULL line; the repo is public).
+            echo "--- producer console (deduped) ---"
+            cat "${LOGS[@]}" 2>/dev/null | grep -a 'producer\]' | grep -av 'TOKFULL' \
+              | sed 's/.*\[producer\]/[producer]/' \
+              | sed 's/len=[0-9]* head=.*/len=... head=.../' \
+              | sort | uniq -c | sort -rn | head -20
+              echo "--- off-screen click refusals (window mispositioned) ---"
+            sum_over 'CLICKOFFSCREEN'
+            echo "--- clicks issued ---"; cat /tmp/clicks-*.log 2>/dev/null | tail -5
+            echo "::error::minted 0. Read it off the counters above: clicks=0 means the widget never became clickable (CLICKAT never fired -- lane stayed collapsed); clicks>0 with BEFORE_INTERACTIVE>0 and AFTER_INTERACTIVE=0 means the click landed but Cloudflare still refused this browser/exit."
+          fi
+
+          # Explicit teardown, AFTER the result is printed. Leaving the browsers,
+          # displays and tunnels to the runner's own orphan reaper wedged run
+          # 30353621246 in post-job cleanup for 28+ minutes on a 12-minute job --
+          # and the logs of a run that has to be cancelled are truncated, so the
+          # measurement is lost outright. A hung job also holds a concurrency
+          # slot, which the ~6-12 min runner drip-feed makes expensive.
+          echo "tearing down $NINST instance(s)"
+          for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done
+          sleep 2
+          for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
+          pkill -f 'Xvfb :9' 2>/dev/null
+          pkill -f 'wireproxy -c' 2>/dev/null
+          echo "teardown done"
+          exit 0
+
+      - name: 7. Dispatch successor
+        if: ${{ always() && github.event.inputs.chain == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.CHAIN_PAT }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if gh workflow run gartic-chromium-warp.yml -f chain=true; then
+              echo "successor dispatched on attempt $attempt"; exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          exit 1
