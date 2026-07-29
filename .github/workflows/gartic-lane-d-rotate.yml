@@ -924,6 +924,15 @@ jobs:
           CLICK_STYLE="${CLICK_STYLE:-human}"
           ROTATE_MIN="${ROTATE_MIN:-0}"
           ROTATE_EVERY="${ROTATE_EVERY:-1}"
+          # SAFETY: the tenure loop's rotate_tunnel() is OpenVPN/VPN-Gate-specific.
+          # On any other egress it would find no /tmp/vpn candidates, call
+          # refresh_feed(), and silently convert a WARP run into a VPN Gate run --
+          # which would not merely fail, it would answer the wrong question while
+          # looking like it answered the right one. Refuse instead.
+          if [ "${EGRESS:-warp}" != "vpngate" ] && [ "$ROTATE_MIN" -gt 0 ]; then
+            echo "::warning::rotate_min=$ROTATE_MIN ignored -- exit rotation is implemented for egress=vpngate only (this run is egress=${EGRESS})"
+            ROTATE_MIN=0
+          fi
           MYRUN="gh-${GITHUB_RUN_ID:-unknown}"
           echo "click style: $CLICK_STYLE   rotate_min: $ROTATE_MIN min"
           mapfile -t TUNS < /tmp/tunnels.txt
