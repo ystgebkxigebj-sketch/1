@@ -222,6 +222,19 @@ on:
         description: "VPN Gate: total number of concurrent jobs sharing the feed"
         required: false
         default: "1"
+      kill_lane_at_min:
+        # 24/7 operation makes "what happens when a volunteer relay dies" a
+        # first-class question, and a fail-closed path that has never been
+        # exercised is a path that fails at 3am. This kills lane 0's openvpn
+        # (and ONLY openvpn -- the browser stays in the namespace) after N
+        # minutes, then dumps that lane's routes and both egress views. The
+        # correct outcome is that the lane can reach NOTHING and mints zero;
+        # the failure we are guarding against is it falling back to the
+        # runner's AS8075 egress and quietly minting tokens the relay would
+        # book against a residential exit. 0 = never.
+        description: "netns only: kill lane 0's tunnel after N minutes to exercise the fail-closed path"
+        required: false
+        default: "0"
       block_v6:
         # openvpn's `redirect-gateway` moves IPv4 ONLY unless the server pushes
         # v6 routes, and challenges.cloudflare.com has AAAA records that
@@ -1033,6 +1046,7 @@ jobs:
           VERIFY_EVERY: ${{ github.event.inputs.verify_every }}
           CLICK_STYLE: ${{ github.event.inputs.click_style }}
           APPEARANCE: ${{ github.event.inputs.appearance }}
+          KILL_LANE_AT_MIN: ${{ github.event.inputs.kill_lane_at_min }}
         run: |
           # GitHub invokes every step as `bash -e`, and `set -uo pipefail` does
           # NOT clear that. A monitoring loop must not be fatal: `grep -c`
@@ -1240,6 +1254,34 @@ jobs:
             for l in "${LOGS[@]}"; do c=$(grep -ac "$1" "$l" 2>/dev/null); s=$(( s + ${c:-0} )); done
             echo "$s"
           }
+
+          # ---- deliberate relay death, to exercise the fail-closed path ------
+          # A volunteer relay WILL drop during 24/7 operation. The dangerous
+          # outcome is not the lane going quiet, it is the lane silently falling
+          # back to the runner's AS8075 egress and continuing to mint -- the
+          # relay would then book Azure-issued tokens against a residential
+          # exit and every per-exit figure would be a fiction. Kill only the
+          # openvpn process; the browser stays in the namespace, which is
+          # exactly the situation a real drop creates.
+          if [ "${KILL_LANE_AT_MIN:-0}" != "0" ] && [ "$NSMODE" = true ]; then
+            ( sleep $(( KILL_LANE_AT_MIN * 60 ))
+              kns="${NSS[0]}"; kn="${IDX[0]}"
+              kmint=$(grep -ac 'TOKFULL ' "/tmp/chrome-$kn.log" 2>/dev/null)
+              echo "[killtest] t=${KILL_LANE_AT_MIN}m killing openvpn in $kns (lane $kn), minted so far=${kmint:-0}"
+              sudo ip netns pids "$kns" 2>/dev/null \
+                | xargs -r ps -o pid=,comm= -p 2>/dev/null \
+                | awk 'tolower($2) ~ /openvpn/ {print $1}' | xargs -r sudo kill -9
+              sleep 6
+              echo "[killtest] routes after kill:"
+              sudo ip netns exec "$kns" ip route show 2>/dev/null | sed 's/^/[killtest]   /'
+              echo "[killtest] ipify after kill: '$(sudo ip netns exec "$kns" curl -4 -s --max-time 10 https://api.ipify.org 2>/dev/null)'  (EMPTY = fail-closed OK)"
+              echo "[killtest] cf_trace after kill: '$(sudo ip netns exec "$kns" curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')'  (EMPTY = fail-closed OK)"
+              echo "[killtest] relay reachable after kill: '$(sudo ip netns exec "$kns" curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://mohanadino.duckdns.org:8443/stats 2>/dev/null)'  (000 = fail-closed OK)"
+              sleep 240
+              kmint2=$(grep -ac 'TOKFULL ' "/tmp/chrome-$kn.log" 2>/dev/null)
+              echo "[killtest] +4min after kill: minted ${kmint:-0} -> ${kmint2:-0} (NO INCREASE = fail-closed OK)"
+            ) &
+          fi
 
           END=$(( $(date +%s) + MINUTES * 60 ))
           verified=0; accepted=0; lastcheck=0; vturn=0; EGCHK=0
