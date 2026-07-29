@@ -323,11 +323,26 @@ jobs:
           TARGET_RATE: "45"      # aim here; headroom beats the last few tokens
           CEILING_RATE: "55"     # Lane A brackets the cliff at 55-60 true
           FLOOR_RATE: "35"       # only add a runner below this (hysteresis)
-          # ~12 TRUE tok/min per runner, and the VM anchor already contributes
-          # ~12 against this SAME budget, so 45/min is about 3 runners + the VM.
-          # DO NOT RAISE: past the ceiling the whole provider drops toward 0% and,
-          # because the relay serves newest-first, the refused tokens crowd out
-          # the good ones -- so raising this yields FEWER accepted tokens.
+          # SIZING. Lane C measured 13.7 TRUE tok/min per runner at tunnels=1
+          # (three instruments agreeing). The VM anchor contributes ~12 TRUE
+          # against this SAME budget, so:
+          #     MAX_RUNNERS = ceil( (TARGET_RATE - 12) / 13.7 )
+          # At TARGET=45 that is 3, worst case 12 + 3*13.7 = 53.1, just under the
+          # 55 ceiling. If Lane D's ramp moves the ceiling, change TARGET_RATE and
+          # CEILING_RATE and re-apply that formula; nothing else in the loop
+          # changes. The loop then VERIFIES the achieved aggregate each tick
+          # rather than assuming the per-runner figure held.
+          #
+          # tunnels=1 deliberately, even though 2 browsers give ~23.2/min per
+          # runner: GRANULARITY BEATS DENSITY. Overshooting the ceiling costs
+          # 100% of the provider, not merely the excess, so approaching it in
+          # 13.7 steps is far safer than in 23.2 steps.
+          #
+          # DO NOT RAISE to buy more tokens: past the ceiling the whole provider
+          # drops toward 0% and, because the relay serves newest-first, the
+          # refused tokens crowd out the good ones. More capacity = another
+          # PROVIDER, not more runners on a saturated one.
+          RUNNER_RATE: "13.7"
           MAX_RUNNERS: "3"
           # If providers turn out NOT to be independent (Lane B is driving VPN
           # Gate through its cliff while WARP produces), set this to a number and
@@ -443,7 +458,7 @@ jobs:
           if gh workflow run "$WF" \
                -f chain=true -f egress="$PROVIDER" \
                -f vpngate_index="$idx" -f vpngate_stride="$STRIDE" \
-               -f minutes="$mins" -f per_min=12 -f lanes=2 \
+               -f minutes="$mins" -f per_min=12 -f lanes=2 -f tunnels=1 \
                -f post_to_relay=true -f strip_dom=true; then
             echo "TRUE rate ${vg_rate} < floor ${FLOOR_RATE} — added runner (index=$idx minutes=$mins), now $((inflight+1))/$MAX_RUNNERS"
           else
