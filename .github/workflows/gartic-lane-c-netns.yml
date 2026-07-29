@@ -428,14 +428,23 @@ jobs:
                   # so multiplexing can never poach a relay belonging to another
                   # runner -- the exact collision the stride mechanism exists to
                   # prevent, which it would otherwise reintroduce.
-                  mkdir -p "/tmp/vpn$i"
+                  # The feed carries only ~98 relays with configs, so a lane's own
+                  # sub-slice can be 1-2 deep at high N -- not enough retries when
+                  # a volunteer relay is dead. Append this JOB's whole slice as
+                  # z-prefixed fallbacks (sorted last) and let the CLAIMED guard
+                  # stop two lanes landing on one relay.
+                  mkdir -p "/tmp/vpn$i" "/tmp/vpnfb$i"
                   python3 /tmp/vpngate.py /tmp/vpngate.csv "/tmp/vpn$i" \
                     --index $(( GI + i * GS )) --stride $(( GS * N )) --count 10 || true
-                  # Fallback stays inside this job's slice too; the CLAIMED guard
-                  # below rejects a relay a sibling lane already took.
-                  ls /tmp/vpn$i/*.ovpn >/dev/null 2>&1 || \
-                    python3 /tmp/vpngate.py /tmp/vpngate.csv "/tmp/vpn$i" \
-                      --index "$GI" --stride "$GS" --count 24 || true
+                  python3 /tmp/vpngate.py /tmp/vpngate.csv "/tmp/vpnfb$i" \
+                    --index "$GI" --stride "$GS" --count 24 2>/dev/null || true
+                  for f in /tmp/vpnfb$i/*.ovpn; do
+                    [ -f "$f" ] || continue
+                    b=$(basename "$f"); key="${b#*-}"
+                    ls "/tmp/vpn$i" 2>/dev/null | sed 's/^[^-]*-//' | grep -Fxq "$key" && continue
+                    cp "$f" "/tmp/vpn$i/z-$key"
+                  done
+                  echo "lane $i: $(ls /tmp/vpn$i/*.ovpn 2>/dev/null | wc -l) candidate relays"
                   ok=""
                   for cfg in /tmp/vpn$i/*.ovpn; do
                     [ -f "$cfg" ] || continue
@@ -462,6 +471,21 @@ jobs:
                   if [ -z "$ok" ]; then
                     echo "lane $i: NO relay came up"; tail -6 "/tmp/ovpn-$i.log" 2>/dev/null
                     continue
+                  fi
+                  # FAIL CLOSED. openvpn's redirect-gateway adds 0.0.0.0/1 and
+                  # 128.0.0.0/1 over the tun but LEAVES the veth default route in
+                  # place, so if a volunteer relay drops during a 3-hour run the
+                  # lane silently falls back to the runner's own AS8075 egress --
+                  # which both poisons attribution (the relay would book those
+                  # tokens against a GitHub IP) and mints tokens gartic refuses.
+                  # Dropping the veth default makes a dead tunnel mint NOTHING,
+                  # which is visible, instead of minting wrongly, which is not.
+                  # Only safe when the tun really did take over the whole space.
+                  if sudo ip netns exec "$ns" ip route show | grep -q '^0.0.0.0/1 '; then
+                    sudo ip netns exec "$ns" ip route del default via "$sub.1" 2>/dev/null \
+                      && echo "lane $i: veth default route removed (fail-closed)"
+                  else
+                    echo "lane $i: no 0.0.0.0/1 split route -- KEEPING veth default (would otherwise black-hole)"
                   fi
                   CLAIMED="$CLAIMED$ok "
                   cc=$(basename "$cfg" | cut -d- -f2)
@@ -1113,7 +1137,7 @@ jobs:
           }
 
           END=$(( $(date +%s) + MINUTES * 60 ))
-          verified=0; accepted=0; lastcheck=0; vturn=0
+          verified=0; accepted=0; lastcheck=0; vturn=0; EGCHK=0
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 30
             alive=0
@@ -1138,6 +1162,25 @@ jobs:
             # first-class counter, not something to discover from a dead job.
             MEM=$(free -m | awk '/^Mem:/{printf "used=%dM avail=%dM", $3, $7}')
             echo "[summary] t=${EL}s minted=$MINTED rate=${RATE}/min clicks=$CLICKS alive=$alive/$NINST $MEM |$PER"
+
+            # Every ~5 min, re-check each lane's ACTUAL egress from inside its
+            # own namespace. A volunteer relay that drops during a long run is
+            # otherwise invisible: with fail-closed routing the lane just goes
+            # quiet, and "quiet" is indistinguishable from "slow" on a rate.
+            EGCHK=$(( EGCHK + 1 ))
+            if [ "$NSMODE" = true ] && [ $(( EGCHK % 10 )) -eq 0 ]; then
+              for j in "${!IDX[@]}"; do
+                jn="${IDX[$j]}"; jns="${NSS[$j]}"
+                [ "$jns" = "-" ] && continue
+                cur=$(sudo ip netns exec "$jns" curl -4 -s --max-time 8 https://api.ipify.org 2>/dev/null)
+                want=$(awk -v n="$jn" '$1==n{print $3}' /tmp/tunnels.txt)
+                if [ -n "$cur" ] && [ "$cur" = "$want" ]; then
+                  echo "[egress] l$jn ok $cur"
+                else
+                  echo "[egress] l$jn DRIFTED/DEAD want=$want got=${cur:-<none>}"
+                fi
+              done
+            fi
 
             # Verify one fresh token every ~3 min, ROTATING instances so every
             # exit gets checked. Tokens are single-use, so a verified one is
