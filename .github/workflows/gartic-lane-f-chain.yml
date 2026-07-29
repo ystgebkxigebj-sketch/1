@@ -275,89 +275,130 @@ jobs:
       group: lane-f-supervisor
       cancel-in-progress: true
     steps:
-      - name: Converge fleet on target, emit health line
+      # ─────────────────────────────────────────────────────────────────────
+      # RATE-BASED, PER PROVIDER. Read this before changing any number here.
+      #
+      # Acceptance is a dose-response against the TOTAL pipeline mint rate for a
+      # provider, evaluated at redemption (Lane A, 2026-07-29):
+      #
+      #     0-90 tok/min -> 100% | 90-120 -> 66% | 120-150 -> 12% | 150+ -> 0%
+      #
+      # It is a CLIFF, not a slope. So this supervisor holds an aggregate mint
+      # RATE per provider, and NOT a runner count. A count-based target walks
+      # straight past 90 tok/min and takes the whole provider to 0% — and since
+      # the relay serves newest-first, the refused tokens then crowd out the good
+      # ones, so the fleet gets WORSE as it grows. That is the mechanism behind
+      # every "scaling up caused an outage" event in this project's history.
+      #
+      # A runner delivers ~20-25 mint/min, so a 75/min target is **3-4 runners**.
+      # NOT twenty. If you are tempted to raise MAX_RUNNERS to get more tokens:
+      # you will get FEWER accepted tokens. More capacity comes from adding a
+      # PROVIDER (each has its own independent budget), never from adding
+      # runners to a provider that is already at its ceiling.
+      #
+      # Overshoot is far more expensive than undershoot (100% -> 0%, no slope),
+      # so we target 75 against a measured 90 threshold and add at most one
+      # runner per tick.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Hold the provider mint rate under its ceiling, emit health line
         env:
           GH_TOKEN: ${{ secrets.CHAIN_PAT }}
           GH_REPO: ${{ github.repository }}
           WF: gartic-lane-f-chain.yml
-          ENABLED: ${{ vars.FLEET_ENABLED }}
-          TARGET: ${{ vars.LANE_F_TARGET }}
           RELAY: https://mohanadino.duckdns.org:8443
           RELAY_SECRET: 74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434
+          # ── VPN Gate provider budget ──
+          TARGET_RATE: "75"      # aim here
+          CEILING_RATE: "90"     # measured cliff; never cross it
+          FLOOR_RATE: "60"       # only add a runner below this (hysteresis)
+          MAX_RUNNERS: "4"       # ~20-25 mint/min each. DO NOT RAISE. See above.
           INDEX_BASE: "14"
           STRIDE: "16"
           BASE_MIN: "300"
           SPREAD_MIN: "25"
-          MAX_PER_TICK: "3"
         run: |
           set -uo pipefail
 
-          enabled="${ENABLED:-1}"
-          target="${TARGET:-0}"
+          # Read the switch LIVE. `vars.FLEET_ENABLED` in an env: block is
+          # resolved when the JOB STARTS, so a run already in flight keeps the
+          # old value and the kill switch appears to be ignored for one whole
+          # generation. Measured: switch set 15:03:23, a successor still went
+          # out at 15:06:57 from a job that started 15:00:47.
+          enabled=$(gh api "repos/$GH_REPO/actions/variables/FLEET_ENABLED" --jq '.value' 2>/dev/null || echo "1")
           case "$(echo "$enabled" | tr 'A-Z' 'a-z')" in
-            0|false|no|off) echo "KILL SWITCH: FLEET_ENABLED=$enabled — dispatching nothing."; target=0 ;;
+            0|false|no|off) STOP=1 ;; *) STOP=0 ;;
           esac
-          case "$target" in ''|*[!0-9]*) target=0 ;; esac
 
-          # Count only WORKERS. This workflow file also runs as the supervisor,
-          # so a naive count would include this very run and the fleet would
-          # sit one worker short forever.
+          ex=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits" || echo '{}')
+          st=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats"       || echo '{}')
+
+          # Provider fold, matching Lane A's providers.tsv: 104.28.x is
+          # Cloudflare WARP (the VM's own exit, its own separate budget);
+          # everything else on this relay is VPN Gate via GitHub.
+          vg='[.exits[]?|select((.src|startswith("104.28."))|not)]'
+          vg_rate=$(echo "$ex"  | jq -r "$vg|map(.mintPerMin)|add // 0" 2>/dev/null || echo 0)
+          vg_exits=$(echo "$ex" | jq -r "$vg|map(select(.mintPerMin>0))|length" 2>/dev/null || echo 0)
+          vg_acc=$(echo "$ex"   | jq -r "$vg|map(select(.mintPerMin>0)|.recentAcceptPct)|if length>0 then (add/length|floor) else \"n/a\" end" 2>/dev/null || echo '?')
+          warp_rate=$(echo "$ex"| jq -r '[.exits[]?|select(.src|startswith("104.28."))|.mintPerMin]|add // 0' 2>/dev/null || echo 0)
+          queued=$(echo "$st"   | jq -r '.queued // "?"')
+          oldest=$(echo "$st"   | jq -r 'if .oldestAgeMs then (.oldestAgeMs/1000|floor) else "?" end')
+          case "$vg_rate" in ''|*[!0-9]*) vg_rate=0 ;; esac
+
           inflight=$(gh run list -w "$WF" -L 100 --json status,event \
             --jq '[.[]|select(.event=="workflow_dispatch" and (.status=="in_progress" or .status=="queued"))]|length' 2>/dev/null || echo 0)
           case "$inflight" in ''|*[!0-9]*) inflight=0 ;; esac
-
-          # Account-wide concurrency is shared with every other lane. Dispatching
-          # into a full queue does not get us a runner — it just parks jobs in
-          # `queued`, where they hold a slot and starve everyone. Back off.
-          allq=$(gh run list -L 100 --json status \
-            --jq '[.[]|select(.status=="queued")]|length' 2>/dev/null || echo 0)
+          allq=$(gh run list -L 100 --json status --jq '[.[]|select(.status=="queued")]|length' 2>/dev/null || echo 0)
           case "$allq" in ''|*[!0-9]*) allq=0 ;; esac
 
-          deficit=$(( target - inflight ))
-          [ "$deficit" -lt 0 ] && deficit=0
-          [ "$deficit" -gt "$MAX_PER_TICK" ] && deficit=$MAX_PER_TICK
-          if [ "$allq" -ge 3 ] && [ "$deficit" -gt 0 ]; then
-            echo "queue depth $allq across the account — backing off this tick"
-            deficit=0
+          action="hold"
+          if [ "$STOP" = "1" ]; then
+            action="killswitch"
+          elif [ "$vg_rate" -ge "$CEILING_RATE" ]; then
+            action="shed"
+          elif [ "$vg_rate" -lt "$FLOOR_RATE" ] && [ "$inflight" -lt "$MAX_RUNNERS" ]; then
+            action="add"
+            [ "$allq" -ge 3 ] && action="hold(queue=$allq)"
           fi
 
-          # ── health line ────────────────────────────────────────────────────
-          st=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats" || echo '{}')
-          ex=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits" || echo '{}')
-          queued=$(echo "$st"  | jq -r '.queued  // "?"')
-          oldest=$(echo "$st"  | jq -r 'if .oldestAgeMs then (.oldestAgeMs/1000|floor) else "?" end')
-          totin=$(echo "$st"   | jq -r '.totalIn  // "?"')
-          minting=$(echo "$ex" | jq -r '[.exits[]?|select(.mintPerMin>0)]|length' 2>/dev/null || echo '?')
-          mrate=$(echo "$ex"   | jq -r '[.exits[]?|.mintPerMin]|add // 0' 2>/dev/null || echo '?')
-          acc=$(echo "$ex"     | jq -r '[.exits[]?|select(.mintPerMin>0)|.recentAcceptPct]|if length>0 then (add/length|floor) else "n/a" end' 2>/dev/null || echo '?')
+          line="FLEET laneF enabled=$enabled action=$action | vpngate rate=${vg_rate}/min (floor=$FLOOR_RATE target=$TARGET_RATE ceiling=$CEILING_RATE) exits=$vg_exits accept=${vg_acc}% runners=$inflight/$MAX_RUNNERS | warp rate=${warp_rate}/min | relay queued=$queued oldest=${oldest}s"
+          echo "$line"; echo "$line" >> "$GITHUB_STEP_SUMMARY"
 
-          line="FLEET laneF enabled=$enabled target=$target inflight=$inflight deficit=$deficit | relay queued=$queued oldest=${oldest}s totalIn=$totin | exits minting=$minting mint=${mrate}/min recentAccept=${acc}%"
-          echo "$line"
-          echo "$line" >> "$GITHUB_STEP_SUMMARY"
+          case "$action" in
+            killswitch) echo "FLEET_ENABLED=$enabled — dispatching nothing."; exit 0 ;;
+            hold*)      echo "within band — no change."; exit 0 ;;
+            shed)
+              # Over the cliff. Cancel the NEWEST worker: it has produced least,
+              # so we lose the least, and the older ones keep their warm exits.
+              victim=$(gh run list -w "$WF" -L 100 --json databaseId,status,event,createdAt \
+                --jq '[.[]|select(.event=="workflow_dispatch" and .status=="in_progress")]|sort_by(.createdAt)|last|.databaseId' 2>/dev/null || echo "")
+              if [ -n "$victim" ] && [ "$victim" != "null" ]; then
+                echo "rate ${vg_rate} >= ceiling ${CEILING_RATE} — cancelling newest worker $victim"
+                gh run cancel "$victim" || echo "cancel failed; next tick retries"
+              else
+                echo "rate over ceiling but no worker of ours to shed (another lane is producing)"
+              fi
+              exit 0 ;;
+          esac
 
-          # ── converge ───────────────────────────────────────────────────────
-          i=0
-          while [ "$i" -lt "$deficit" ]; do
-            idx=$(( INDEX_BASE + i ))
-            # Stagger lifetimes so a cold fill does not create a fleet that all
-            # expires in the same minute. Runners arrive ~1 per 6-12 min, so a
-            # synchronised expiry costs an hour of production. Successors
-            # inherit their parent's `minutes` verbatim, so staggering once here
-            # persists for the life of the fleet.
-            mins=$(( BASE_MIN - i * SPREAD_MIN - (RANDOM % 7) ))
-            [ "$mins" -lt 20 ] && mins=20
-            if gh workflow run "$WF" \
-                 -f chain=true -f egress=vpngate \
-                 -f vpngate_index="$idx" -f vpngate_stride="$STRIDE" \
-                 -f minutes="$mins" -f per_min=12 -f lanes=2 \
-                 -f post_to_relay=true -f strip_dom=true; then
-              echo "  dispatched worker $((i+1))/$deficit (index=$idx minutes=$mins)"
-            else
-              echo "  dispatch $((i+1))/$deficit FAILED — next tick retries"
-            fi
-            i=$(( i + 1 ))
-            sleep 3
-          done
+          # ── add exactly one runner ──────────────────────────────────────────
+          # One per tick, deliberately. Runners arrive ~1 per 6-12 min anyway,
+          # and a burst of dispatches would overshoot the cliff before the rate
+          # signal caught up.
+          idx=$(( INDEX_BASE + inflight ))
+          # Stagger lifetimes so the fleet does not all expire in the same
+          # minute. Successors inherit `minutes` verbatim, so a stagger set here
+          # persists for the life of the chain.
+          mins=$(( BASE_MIN - inflight * SPREAD_MIN - (RANDOM % 7) ))
+          [ "$mins" -lt 20 ] && mins=20
+          if gh workflow run "$WF" \
+               -f chain=true -f egress=vpngate \
+               -f vpngate_index="$idx" -f vpngate_stride="$STRIDE" \
+               -f minutes="$mins" -f per_min=12 -f lanes=2 \
+               -f post_to_relay=true -f strip_dom=true; then
+            echo "rate ${vg_rate} < floor ${FLOOR_RATE} — added runner (index=$idx minutes=$mins), now $((inflight+1))/$MAX_RUNNERS"
+          else
+            echo "dispatch FAILED — next tick retries"
+          fi
 
       # GitHub disables scheduled workflows after 60 days without repository
       # activity — that would end 24/7 operation silently. One dated commit
@@ -1288,31 +1329,45 @@ jobs:
           WF: gartic-lane-f-chain.yml
           REF: ${{ github.ref_name }}
           ALL_INPUTS: ${{ toJSON(github.event.inputs) }}
-          ENABLED: ${{ vars.FLEET_ENABLED }}
-          TARGET: ${{ vars.LANE_F_TARGET }}
+          RELAY: https://mohanadino.duckdns.org:8443
+          RELAY_SECRET: 74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434
+          CEILING_RATE: "90"
+          MAX_RUNNERS: "4"
         run: |
           set -uo pipefail
 
-          enabled="${ENABLED:-1}"
+          # Read the switch LIVE, not from the `vars` context: that is resolved
+          # when the JOB STARTS, so a run already in flight carries the stale
+          # value and the kill switch looks ignored for a whole generation.
+          # Measured: switch set 15:03:23Z, a successor still went out 15:06:57Z
+          # from a job that had started at 15:00:47Z.
+          enabled=$(gh api "repos/$GH_REPO/actions/variables/FLEET_ENABLED" --jq '.value' 2>/dev/null || echo "1")
           case "$(echo "$enabled" | tr 'A-Z' 'a-z')" in
             0|false|no|off)
               echo "KILL SWITCH: FLEET_ENABLED=$enabled — not dispatching a successor."
               exit 0 ;;
           esac
-          target="${TARGET:-0}"
-          case "$target" in ''|*[!0-9]*) target=0 ;; esac
-          if [ "$target" -eq 0 ]; then
-            echo "LANE_F_TARGET=0 — lane is parked, not dispatching."; exit 0
+
+          # Never chain past the provider's acceptance cliff. Above ~90 tok/min
+          # VPN Gate acceptance goes to zero, and refused tokens crowd out good
+          # ones because the relay serves newest-first. The supervisor sheds;
+          # this just declines to make it worse.
+          ex=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits" || echo '{}')
+          vg_rate=$(echo "$ex" | jq -r '[.exits[]?|select((.src|startswith("104.28."))|not)|.mintPerMin]|add // 0' 2>/dev/null || echo 0)
+          case "$vg_rate" in ''|*[!0-9]*) vg_rate=0 ;; esac
+          if [ "$vg_rate" -ge "$CEILING_RATE" ]; then
+            echo "vpngate rate ${vg_rate}/min >= ceiling ${CEILING_RATE} — not dispatching a successor."
+            exit 0
           fi
 
-          # Do not replace myself if the fleet is already at target without me.
+          # Do not replace myself if the fleet is already full without me.
           # Counting workers only (this file also runs as the supervisor) and
           # excluding this very run, which is still in_progress right now.
           inflight=$(gh run list -w "$WF" -L 100 --json status,event,databaseId \
             --jq "[.[]|select(.event==\"workflow_dispatch\" and (.status==\"in_progress\" or .status==\"queued\") and (.databaseId != ${GITHUB_RUN_ID}))]|length" 2>/dev/null || echo 0)
           case "$inflight" in ''|*[!0-9]*) inflight=0 ;; esac
-          if [ "$inflight" -ge "$target" ]; then
-            echo "fleet already at target ($inflight/$target) without me — not dispatching."
+          if [ "$inflight" -ge "$MAX_RUNNERS" ]; then
+            echo "fleet already at MAX_RUNNERS ($inflight/$MAX_RUNNERS) without me — not dispatching."
             exit 0
           fi
 
