@@ -195,7 +195,14 @@ on:
         #              but cannot be the production answer.
         #   direct   - control. Expect 600010 (Cloudflare refuses to challenge
         #              AS8075 directly); confirms the runner itself is the problem.
-        description: "warp | vpngate | webshare | direct"
+        #   freeproxy - LANE E. Free public CONNECT/SOCKS5 proxies: a DIFFERENT
+        #              egress provider from VPN Gate, ~4,700 addresses across
+        #              ~4,000 /24s with no owner and fast churn. Screened
+        #              against Cloudflare's own cdn-cgi/trace before launch
+        #              (leak + warp=on rejected). ~75% datacenter ASNs, which is
+        #              exactly the question: does gartic refuse datacenter-origin
+        #              tokens outright?
+        description: "warp | vpngate | freeproxy | webshare | direct"
         required: false
         default: "warp"
       vpngate_index:
@@ -210,6 +217,14 @@ on:
         description: "VPN Gate: total number of concurrent jobs sharing the feed"
         required: false
         default: "1"
+      freeproxy_count:
+        # How many distinct free proxies to bring up (one browser instance each).
+        # For the provider-asymmetry test this wants to be LARGE and spread over
+        # many /24s: if the limiter is provider-keyed they degrade together, if
+        # it is per-address they degrade independently.
+        description: "freeproxy egress: how many distinct proxies to use"
+        required: false
+        default: "3"
       relay_filter:
         # LANE E instrument. --index/--stride can only take an ARITHMETIC slice
         # of the ranked feed, so they cannot pin a *specific* relay, and a
@@ -324,6 +339,7 @@ jobs:
           VPNGATE_INDEX: ${{ github.event.inputs.vpngate_index }}
           VPNGATE_STRIDE: ${{ github.event.inputs.vpngate_stride }}
           RELAY_FILTER: ${{ github.event.inputs.relay_filter }}
+          FREEPROXY_COUNT: ${{ github.event.inputs.freeproxy_count }}
           WEBSHARE_PROXY: ${{ github.event.inputs.webshare_proxy }}
         run: |
           # `set +e` explicitly: GitHub invokes every step as `bash -e {0}` and
@@ -411,6 +427,33 @@ jobs:
                 [ -n "$ip" ] || { echo "::error::webshare proxy unreachable"; exit 1; }
                 echo "webshare_egress=$ip"
                 echo "0 $PURL $ip webshare" >> /tmp/tunnels.txt
+                ;;
+              freeproxy)
+                # LANE E: free public CONNECT/SOCKS5 proxies. A DIFFERENT egress
+                # PROVIDER from VPN Gate -- that is the point. VPN Gate is a
+                # curated 98-row list with an owner; this population is ~4,700
+                # addresses across ~4,000 /24s with no owner and fast churn, so
+                # if the limiter is keyed on an ingestible provider list there
+                # may be no unit here to key on.
+                #
+                # The picker screens against CLOUDFLARE'S OWN VIEW before a
+                # browser is ever launched:
+                #   - cdn-cgi/trace `ip=` must EQUAL the proxy address, else the
+                #     tunnel leaks (very often the host's IPv6) -> rejected
+                #   - `warp=on` means Cloudflare's own network -> rejected
+                #   - challenges.cloudflare.com must answer 2xx/3xx. NOTE: that
+                #     path returns **302**, not 200, even from a clean
+                #     residential IP -- testing for 200 rejects everything.
+                echo 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJMQU5FIEU6IHBpY2sgTiBmcmVlIHB1YmxpYyBwcm94aWVzIHRoYXQgQ0xPVURGTEFSRSBJVFNFTEYgd2lsbCBhY2NlcHQuCgpTY3JlZW5zIGJlZm9yZSBhIGJyb3dzZXIgaXMgZXZlciBsYXVuY2hlZDoKICAtIGNkbi1jZ2kvdHJhY2UgYGlwPWAgbXVzdCBFUVVBTCB0aGUgcHJveHkgYWRkcmVzcywgZWxzZSB0aGUgdHVubmVsIGxlYWtzCiAgICAodmVyeSBvZnRlbiB0aGUgaG9zdCdzIG93biBJUHY2KSAtPiByZWplY3RlZAogIC0gYHdhcnA9b25gIG1lYW5zIENsb3VkZmxhcmUncyBvd24gbmV0d29yayAtPiByZWplY3RlZAogIC0gY2hhbGxlbmdlcy5jbG91ZGZsYXJlLmNvbSBtdXN0IGFuc3dlciAyeHgvM3h4LiAgTk9URTogdGhhdCBwYXRoIHJldHVybnMKICAgICoqMzAyKiosIG5vdCAyMDAsIGV2ZW4gZnJvbSBhIGNsZWFuIHJlc2lkZW50aWFsIElQIC0tIHRlc3RpbmcgZm9yIDIwMAogICAgcmVqZWN0cyBldmVyeSBjYW5kaWRhdGUuCgpQcmludHMgYDxwcm94eS11cmw+IDxpcD4gPGxvYz5gIHBlciBxdWFsaWZ5aW5nIHByb3h5LgoiIiIKaW1wb3J0IGNvbmN1cnJlbnQuZnV0dXJlcyBhcyBmdXQsIHNvY2tldCwgc3NsLCByZSwgc3lzLCByYW5kb20sIHVybGxpYi5yZXF1ZXN0CgpXQU5UID0gaW50KHN5cy5hcmd2WzFdKSBpZiBsZW4oc3lzLmFyZ3YpID4gMSBlbHNlIDMKUE9PTCA9IGludChzeXMuYXJndlsyXSkgaWYgbGVuKHN5cy5hcmd2KSA+IDIgZWxzZSAxNjAwCgpTUkMgPSBbKCJodHRwIiwgICAiaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9odHRwLnR4dCIpLAogICAgICAgKCJzb2NrczUiLCAiaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL1RoZVNwZWVkWC9QUk9YWS1MaXN0L21hc3Rlci9zb2NrczUudHh0IiksCiAgICAgICAoImh0dHAiLCAgICJodHRwczovL2FwaS5wcm94eXNjcmFwZS5jb20vdjQvZnJlZS1wcm94eS1saXN0L2dldD9yZXF1ZXN0PWRpc3BsYXlfcHJveGllcyZwcm90b2NvbD1odHRwJnByb3h5X2Zvcm1hdD1pcHBvcnQmZm9ybWF0PXRleHQiKSwKICAgICAgICgic29ja3M1IiwgImh0dHBzOi8vYXBpLnByb3h5c2NyYXBlLmNvbS92NC9mcmVlLXByb3h5LWxpc3QvZ2V0P3JlcXVlc3Q9ZGlzcGxheV9wcm94aWVzJnByb3RvY29sPXNvY2tzNSZwcm94eV9mb3JtYXQ9aXBwb3J0JmZvcm1hdD10ZXh0IiksCiAgICAgICAoInNvY2tzNSIsICJodHRwczovL3Jhdy5naXRodWJ1c2VyY29udGVudC5jb20vbW9ub3NhbnMvcHJveHktbGlzdC9tYWluL3Byb3hpZXMvc29ja3M1LnR4dCIpXQpFID0gcmUuY29tcGlsZShyIl5cZHsxLDN9KD86XC5cZHsxLDN9KXszfTpcZHsyLDV9JCIpCgoKZGVmIHM1KHJhdywgaG9zdCwgcG9ydCk6CiAgICByYXcuc2VuZGFsbChiIlx4MDVceDAxXHgwMCIpCiAgICBpZiByYXcucmVjdigyKSAhPSBiIlx4MDVceDAwIjoKICAgICAgICByYWlzZSBPU0Vycm9yKCJub2F1dGgiKQogICAgcmF3LnNlbmRhbGwoYiJceDA1XHgwMVx4MDBceDAzIiArIGJ5dGVzKFtsZW4oaG9zdCldKSArIGhvc3QuZW5jb2RlKCkgKyBwb3J0LnRvX2J5dGVzKDIsICJiaWciKSkKICAgIHIgPSByYXcucmVjdig0KQogICAgaWYgbGVuKHIpIDwgMiBvciByWzFdICE9IDA6CiAgICAgICAgcmFpc2UgT1NFcnJvcigicmVmdXNlZCIpCiAgICBrID0gclszXSBpZiBsZW4ocikgPiAzIGVsc2UgMQogICAgcmF3LnJlY3YoKHsxOiA0LCA0OiAxNn0uZ2V0KGspIG9yIHJhdy5yZWN2KDEpWzBdKSArIDIpCgoKZGVmIGNjKHJhdywgaG9zdCwgcG9ydCk6CiAgICByYXcuc2VuZGFsbChmIkNPTk5FQ1Qge2hvc3R9Ontwb3J0fSBIVFRQLzEuMVxyXG5Ib3N0OiB7aG9zdH06e3BvcnR9XHJcblxyXG4iLmVuY29kZSgpKQogICAgYiA9IGIiIgogICAgd2hpbGUgYiJcclxuXHJcbiIgbm90IGluIGI6CiAgICAgICAgZCA9IHJhdy5yZWN2KDQwOTYpCiAgICAgICAgaWYgbm90IGQgb3IgbGVuKGIpID4gNjU1MzY6CiAgICAgICAgICAgIHJhaXNlIE9TRXJyb3IoImNsb3NlZCIpCiAgICAgICAgYiArPSBkCiAgICBpZiBiIiAyMDAiIG5vdCBpbiBiLnNwbGl0KGIiXHJcbiIpWzBdOgogICAgICAgIHJhaXNlIE9TRXJyb3IoImNvbm5lY3QiKQoKCmRlZiBnZXQocHgsIGhvc3QsIHBhdGgsIHQ9MTApOgogICAgc2NoLCBfLCBocCA9IHB4LnBhcnRpdGlvbigiOi8vIikKICAgIGgsIF8sIHAgPSBocC5wYXJ0aXRpb24oIjoiKQogICAgd2l0aCBzb2NrZXQuY3JlYXRlX2Nvbm5lY3Rpb24oKGgsIGludChwKSksIHRpbWVvdXQ9dCkgYXMgcmF3OgogICAgICAgIHJhdy5zZXR0aW1lb3V0KHQpCiAgICAgICAgKHM1IGlmIHNjaCA9PSAic29ja3M1IiBlbHNlIGNjKShyYXcsIGhvc3QsIDQ0MykKICAgICAgICB3aXRoIHNzbC5jcmVhdGVfZGVmYXVsdF9jb250ZXh0KCkud3JhcF9zb2NrZXQocmF3LCBzZXJ2ZXJfaG9zdG5hbWU9aG9zdCkgYXMgdGxzOgogICAgICAgICAgICB0bHMuc2VuZGFsbChmIkdFVCB7cGF0aH0gSFRUUC8xLjFcclxuSG9zdDoge2hvc3R9XHJcbiIKICAgICAgICAgICAgICAgICAgICAgICAgZiJVc2VyLUFnZW50OiBNb3ppbGxhLzUuMFxyXG5Db25uZWN0aW9uOiBjbG9zZVxyXG5cclxuIi5lbmNvZGUoKSkKICAgICAgICAgICAgYiA9IGIiIgogICAgICAgICAgICB3aGlsZSBUcnVlOgogICAgICAgICAgICAgICAgZCA9IHRscy5yZWN2KDY1NTM2KQogICAgICAgICAgICAgICAgaWYgbm90IGQgb3IgbGVuKGIpID4gMjYyMTQ0OgogICAgICAgICAgICAgICAgICAgIGJyZWFrCiAgICAgICAgICAgICAgICBiICs9IGQKICAgICAgICAgICAgcmV0dXJuIGIuZGVjb2RlKCJ1dGYtOCIsICJyZXBsYWNlIikKCgpkZWYgdmV0KHB4KToKICAgIGlwID0gcHguc3BsaXQoIi8vIilbMV0uc3BsaXQoIjoiKVswXQogICAgdHJ5OgogICAgICAgIHQgPSBnZXQocHgsICJ3d3cuY2xvdWRmbGFyZS5jb20iLCAiL2Nkbi1jZ2kvdHJhY2UiKQogICAgICAgIGlmICIgMjAwIiBub3QgaW4gdC5zcGxpdCgiXHJcbiIpWzBdOgogICAgICAgICAgICByZXR1cm4gTm9uZQogICAgICAgIGt2ID0gZGljdChsLnNwbGl0KCI9IiwgMSkgZm9yIGwgaW4gdC5wYXJ0aXRpb24oIlxyXG5cclxuIilbMl0uc3RyaXAoKS5zcGxpdGxpbmVzKCkgaWYgIj0iIGluIGwpCiAgICAgICAgaWYga3YuZ2V0KCJpcCIpICE9IGlwOgogICAgICAgICAgICByZXR1cm4gTm9uZQogICAgICAgIGlmIGt2LmdldCgid2FycCIpID09ICJvbiI6CiAgICAgICAgICAgIHJldHVybiBOb25lCiAgICAgICAgYyA9IGdldChweCwgImNoYWxsZW5nZXMuY2xvdWRmbGFyZS5jb20iLCAiL3R1cm5zdGlsZS92MC9hcGkuanMiKQogICAgICAgIHN0ID0gYy5zcGxpdCgiXHJcbiIpWzBdLnNwbGl0KCkKICAgICAgICBpZiBsZW4oc3QpIDwgMiBvciBzdFsxXVswXSBub3QgaW4gIjIzIjoKICAgICAgICAgICAgcmV0dXJuIE5vbmUKICAgICAgICByZXR1cm4gZiJ7cHh9IHtpcH0ge2t2LmdldCgnbG9jJywgJz8/Jyl9IgogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICByZXR1cm4gTm9uZQoKCmRlZiBtYWluKCk6CiAgICBjYW5kID0gW10KICAgIGZvciBzY2gsIHUgaW4gU1JDOgogICAgICAgIHRyeToKICAgICAgICAgICAgYm9keSA9IHVybGxpYi5yZXF1ZXN0LnVybG9wZW4odSwgdGltZW91dD0yNSkucmVhZCgpLmRlY29kZSgidXRmLTgiLCAicmVwbGFjZSIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBwcmludChmInNvdXJjZSBmYWlsZWQge3Uuc3BsaXQoJy8nKVsyXX06IHtlfSIsIGZpbGU9c3lzLnN0ZGVycikKICAgICAgICAgICAgY29udGludWUKICAgICAgICBmb3IgbG4gaW4gYm9keS5zcGxpdGxpbmVzKCk6CiAgICAgICAgICAgIGxuID0gbG4uc3RyaXAoKQogICAgICAgICAgICBpZiBFLm1hdGNoKGxuKToKICAgICAgICAgICAgICAgIGNhbmQuYXBwZW5kKGYie3NjaH06Ly97bG59IikKICAgIHNlZW4gPSBzZXQoKQogICAgY2FuZCA9IFtjIGZvciBjIGluIGNhbmQgaWYgbm90IChjIGluIHNlZW4gb3Igc2Vlbi5hZGQoYykpXQogICAgcmFuZG9tLnNodWZmbGUoY2FuZCkKICAgIGNhbmQgPSBjYW5kWzpQT09MXQogICAgcHJpbnQoZiJwcm9iaW5nIHtsZW4oY2FuZCl9IGNhbmRpZGF0ZXMgZm9yIHtXQU5UfSBzbG90cyIsIGZpbGU9c3lzLnN0ZGVycikKICAgIGdvb2QsIGJ5MjQgPSBbXSwgc2V0KCkKICAgIHdpdGggZnV0LlRocmVhZFBvb2xFeGVjdXRvcihtYXhfd29ya2Vycz0xMjApIGFzIHBvb2w6CiAgICAgICAgZm9yIHIgaW4gcG9vbC5tYXAodmV0LCBjYW5kKToKICAgICAgICAgICAgaWYgbm90IHI6CiAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICBpcCA9IHIuc3BsaXQoKVsxXQogICAgICAgICAgICBrID0gIi4iLmpvaW4oaXAuc3BsaXQoIi4iKVs6M10pCiAgICAgICAgICAgIGlmIGsgaW4gYnkyNDogICAgICAgICAgIyBuZXZlciB0d28gZXhpdHMgaW4gb25lIC8yNCAtLSB0aGF0IGlzIHRoZSB0cmFwCiAgICAgICAgICAgICAgICBjb250aW51ZQogICAgICAgICAgICBieTI0LmFkZChrKQogICAgICAgICAgICBnb29kLmFwcGVuZChyKQogICAgICAgICAgICBwcmludChyKQogICAgICAgICAgICBzeXMuc3Rkb3V0LmZsdXNoKCkKICAgICAgICAgICAgaWYgbGVuKGdvb2QpID49IFdBTlQ6CiAgICAgICAgICAgICAgICBicmVhawogICAgcHJpbnQoZiJxdWFsaWZpZWQge2xlbihnb29kKX0gYWNyb3NzIHtsZW4oYnkyNCl9IGRpc3RpbmN0IC8yNCIsIGZpbGU9c3lzLnN0ZGVycikKICAgIHJldHVybiAwIGlmIGdvb2QgZWxzZSAxCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIHN5cy5leGl0KG1haW4oKSkK' | base64 -d > /tmp/pickproxy.py
+                python3 /tmp/pickproxy.py "${FREEPROXY_COUNT:-3}" 1600 > /tmp/freeproxy.txt || true
+                cat /tmp/freeproxy.txt
+                [ -s /tmp/freeproxy.txt ] || { echo "::error::no free proxy qualified"; exit 1; }
+                n=0
+                while read -r purl ip loc; do
+                  [ -n "$purl" ] || continue
+                  echo "$n $purl $ip freeproxy-$loc" >> /tmp/tunnels.txt
+                  n=$((n+1))
+                done < /tmp/freeproxy.txt
                 ;;
               direct)
                 ip=$(curl -4 -s --max-time 15 https://api.ipify.org)
