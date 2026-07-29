@@ -554,11 +554,47 @@ jobs:
             }
 
             function lane(i) {
+              // ── 2026-07-29 FORK-BOMB FIX. Do not remove the generation guard.
+              // recycle() used to be non-idempotent and unconditionally scheduled
+              // a fresh build(). FIVE callbacks can fire for the SAME widget
+              // generation (error-callback, timeout-callback, the poll
+              // stuck-branch, the poll success-branch, build()'s own catch) and a
+              // hung widget fires several at once -- so one lane forked into two
+              // build chains, each installing its own callbacks and forking
+              // again. `slot`/`id` are per-lane closures shared by every fork, so
+              // removeChild() only dropped the newest div (every fork leaked a
+              // live widget + iframe + renderer forever) and getResponse(id) only
+              // read the newest fork, so MINTING STOPPED DEAD while thousands of
+              // widgets churned. Measured on the VM: prod_* count 2 -> 2,577
+              // still climbing ~1.2/sec, `minted` frozen 39 minutes, then a
+              // cgroup OOM -- all while the process was alive at 57% CPU.
+              // A generation counter makes every stale callback a no-op, so
+              // exactly one rebuild follows each recycle.
+              var gen = 0;
+              var CAP = LANES * 3;              // hard ceiling on live widgets
               var slot, id, sawInter;
+              function purge(sel) {
+                var olds = document.querySelectorAll(sel);
+                for (var k = 0; k < olds.length; k++) {
+                  var wid = olds[k].getAttribute('data-wid');
+                  if (wid) { try { window.turnstile.remove(wid); } catch (e) {} }
+                  if (olds[k].parentNode) olds[k].parentNode.removeChild(olds[k]);
+                }
+                return olds.length;
+              }
+              function mine() { return 'div[id^="prod_' + i + '_"]'; }
               function build() {
+                var myGen = gen;
                 sawInter = false;
+                purge(mine());
+                var live = document.querySelectorAll('div[id^="prod_"]').length;
+                if (live >= CAP) {
+                  log('FORKBOMB cap=' + CAP + ' live=' + live + ' lane=' + i +
+                      ' -- purging every lane and rebuilding');
+                  purge('div[id^="prod_"]');
+                }
                 slot = document.createElement('div');
-                slot.id = 'prod_' + i;
+                slot.id = 'prod_' + i + '_' + myGen;
                 // The class off-the-shelf Turnstile helpers look for. Our own
                 // driver finds the widget by rect and does not need it, but a
                 // bench measured stock helpers at 3/3 on a classed widget and
@@ -571,13 +607,14 @@ jobs:
                   id = window.turnstile.render(slot, {
                     sitekey: KEY, action: 'join', appearance: APPEARANCE,
                     callback: function(){},
-                    'error-callback': function(c){ log('cf err', c); setTimeout(recycle, 2000); },
+                    'error-callback': function(c){ log('cf err', c); defer(myGen, 2000); },
                     'before-interactive-callback': function(){ sawInter = true; log('BEFORE_INTERACTIVE (lane '+i+')'); },
                     'after-interactive-callback': function(){ log('AFTER_INTERACTIVE (lane '+i+')'); },
-                    'timeout-callback': function(){ recycle(); }
+                    'timeout-callback': function(){ defer(myGen, 0); }
                   });
-                } catch (e) { log('render threw', e && e.message); setTimeout(recycle, 3000); return; }
-                poll(0);
+                  slot.setAttribute('data-wid', String(id));
+                } catch (e) { log('render threw', e && e.message); defer(myGen, 3000); return; }
+                poll(0, myGen);
               }
               function read() {
                 try { var t = window.turnstile.getResponse(id); if (t) return t; } catch(e){}
@@ -617,7 +654,8 @@ jobs:
                 }
                 log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy + ' dpr=' + p.dpr);
               }
-              function poll(n) {
+              function poll(n, myGen) {
+                if (myGen !== gen) return;      // a stale chain must die, not recycle
                 var t = read();
                 if (t) {
                   var now = Date.now();
@@ -627,17 +665,26 @@ jobs:
                   log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16), 'solve='+(sawInter?'int':'auto'));
                   log('TOKFULL ' + (sawInter ? 'int' : 'auto') + ' ' + t);
                   setTimeout(function(){ post(t); }, wait);
-                  setTimeout(recycle, wait + 500);
+                  defer(myGen, wait + 500);
                   return;
                 }
-                if (n > 60) { recycle(); return; }
+                if (n > 60) { defer(myGen, 0); return; }
                 if (n % 5 === 2) emitClick();
-                setTimeout(function(){ poll(n+1); }, 1000);
+                setTimeout(function(){ poll(n+1, myGen); }, 1000);
               }
-              function recycle() {
+              // defer()/recycle() are the ONLY route back to build().
+              // Do not add another caller -- that is exactly how this happened.
+              function defer(myGen, ms) {
+                if (myGen !== gen) return;
+                setTimeout(function(){ recycle(myGen); }, ms);
+              }
+              function recycle(myGen) {
+                if (myGen !== gen) return;      // someone already recycled this gen
+                gen++;                          // invalidates every pending callback
                 try { window.turnstile.remove(id); } catch(e){}
-                if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
-                setTimeout(build, 300);
+                purge(mine());
+                slot = null; id = null;
+                setTimeout(build, 400);
               }
               return build;
             }
