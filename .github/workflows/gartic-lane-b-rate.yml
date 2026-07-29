@@ -135,6 +135,15 @@ on:
         description: "Seconds between acceptance checks. Lower = more samples, costs one token each."
         required: false
         default: "180"
+      rate_url:
+        # Runtime mint-rate channel. Empty = fixed at `per_min`, i.e. the
+        # historical behaviour. When set, the producer re-reads this URL every
+        # 45 s and re-derives GAP, so a staircase can step the aggregate while
+        # holding the exit SET fixed -- no restart, no new relay, no fresh-exit
+        # transient at each step.
+        description: "URL serving a single integer = tokens/min. Empty = fixed per_min."
+        required: false
+        default: ""
       recycle_fix:
         # Lane F root-caused the producer stall: recycle() is non-idempotent
         # and several callers can each schedule a fresh build() for the same
@@ -474,6 +483,7 @@ jobs:
           ROTATE_FP: ${{ github.event.inputs.rotate_fp }}
           RECYCLE_MIN: ${{ github.event.inputs.recycle_min }}
           RECYCLE_FIX: ${{ github.event.inputs.recycle_fix }}
+          RATE_URL: ${{ github.event.inputs.rate_url }}
           APPEARANCE: ${{ github.event.inputs.appearance }}
         run: |
           set -euo pipefail
@@ -526,6 +536,7 @@ jobs:
             var APPEARANCE = '__APPEARANCE__';
             var LABEL = '__LABEL__';
             var RECYCLE_FIX = __RECYCLE_FIX__;
+            var RATE_URL = '__RATE_URL__';
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
             // LANE B TELEMETRY. GitHub serves no logs for a running job and the
@@ -536,8 +547,29 @@ jobs:
               var w = 0;
               try { w = document.querySelectorAll('[id^="prod_"]').length; } catch(e){}
               return LABEL + '-r' + Math.round((Date.now() - T0) / 60000) +
-                     '|w' + w + 'b' + renders + 'm' + minted;
+                     '|w' + w + 'b' + renders + 'm' + minted + 'p' + PER_MIN;
             }
+            // Runtime rate channel. Every failure mode is a no-op that keeps the
+            // last good rate: a staircase step that does not land is visible as an
+            // unchanged `p` in the label, which is far safer than a producer that
+            // silently falls to zero mid-experiment.
+            function pollRate() {
+              if (!RATE_URL) return;
+              fetch(RATE_URL + (RATE_URL.indexOf('?') < 0 ? '?' : '&') + 't=' + Date.now(),
+                    { cache: 'no-store' })
+                .then(function(r){ return r.ok ? r.text() : null; })
+                .then(function(txt){
+                  if (txt === null) return;
+                  var v = parseInt(String(txt).trim(), 10);
+                  if (!isFinite(v) || v < 1 || v > 240) return;
+                  if (v === PER_MIN) return;
+                  log('RATE step ' + PER_MIN + ' -> ' + v + '/min');
+                  PER_MIN = v;
+                  GAP = Math.round(60000 / PER_MIN);
+                })
+                .catch(function(e){ log('rate channel error', e && e.message); });
+            }
+            if (RATE_URL) { pollRate(); setInterval(pollRate, 45000); }
 
             function log(){ console.log.apply(console, ['[producer]'].concat([].slice.call(arguments))); }
 
@@ -840,7 +872,7 @@ jobs:
           LABELJS="gh-${GITHUB_RUN_ID:-unknown}"
           if [ "${RECYCLE_FIX:-true}" = "true" ]; then RFJS=true; else RFJS=false; fi
           echo "recycle_fix=$RFJS"
-          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|; s|__LABEL__|$LABELJS|; s|__RECYCLE_FIX__|$RFJS|" /tmp/ext/producer.js
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|; s|__LABEL__|$LABELJS|; s|__RECYCLE_FIX__|$RFJS|; s|__RATE_URL__|${RATE_URL:-}|" /tmp/ext/producer.js
           echo "rotate_fp=$ROTJS recycle_min=$RECJS"
           grep -c . /tmp/ext/producer.js
 
