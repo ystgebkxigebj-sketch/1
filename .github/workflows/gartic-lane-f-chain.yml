@@ -351,7 +351,27 @@ jobs:
           GLOBAL_CEILING: ""
           INDEX_BASE: "14"
           STRIDE: "16"
-          BASE_MIN: "300"
+          # ── JOB LIFETIME + PER-RUNNER RETIREMENT ───────────────────────
+          # Long jobs were chosen to beat the runner drip-feed (~1 arrival per
+          # 6-12 min), NOT because a long-lived runner is good. Evidence on
+          # 2026-07-29 says an AS8075 runner is excellent for roughly its first
+          # ~400 tokens and a LIABILITY after: two GitHub WARP exits sat at
+          # 25-30% acceptance at ~420 tokens each while the Oracle VM held 100%
+          # in the same minutes at the same per-exit rate.
+          #
+          # A runner minting 12/min at 25% acceptance is WORSE THAN NO RUNNER,
+          # because the relay serves newest-first, so its bad tokens crowd out
+          # good ones from fresh runners. Hence retirement is an acceptance
+          # decision, not a liveness or throughput one.
+          #
+          # ALL THREE RETIREMENT RULES DEFAULT TO OFF (0). Arm them only once
+          # the within-exit lifetime curve confirms the budget.
+          JOB_MINUTES: "300"        # lifetime of a newly dispatched worker
+          RETIRE_TOKENS: "0"        # retire after this many minted (0 = off) <- preferred
+          RETIRE_MINUTES: "0"       # wall-clock fallback if tokens unreadable (0 = off)
+          MIN_ACCEPT_PCT: "0"       # retire below this recent acceptance % (0 = off)
+          MIN_ACCEPT_SAMPLES: "8"   # ...but only once it has this many verdicts
+          RETIRE_DRY_RUN: "false"   # true = report what it WOULD retire, cancel nothing
           SPREAD_MIN: "25"
         run: |
           set -uo pipefail
@@ -414,6 +434,56 @@ jobs:
           allq=$(gh run list -L 100 --json status --jq '[.[]|select(.status=="queued")]|length' 2>/dev/null || echo 0)
           case "$allq" in ''|*[!0-9]*) allq=0 ;; esac
 
+          # ── RETIREMENT PASS ── runs BEFORE the add/shed decision, so the
+          # counts the decision sees already reflect anything retired here.
+          #
+          # Per-runner attribution comes free from the relay: GitHub producers
+          # tag each token `gh-<run id>|...`, so an exit maps back to the exact
+          # run to cancel. This is what makes "retire in TOKENS MINTED" readable
+          # rather than a wall-clock guess.
+          retired=0
+          if [ "${RETIRE_TOKENS:-0}" -gt 0 ] || [ "${MIN_ACCEPT_PCT:-0}" -gt 0 ]; then
+            # OWNERSHIP GUARD -- load-bearing. The relay labels every GitHub
+            # token `gh-<run id>`, but those runs belong to WHICHEVER lane
+            # dispatched them. Without this, arming retirement would cancel
+            # other lanes' runners mid-experiment. Retire only runs of THIS
+            # workflow file.
+            mine=$(gh run list -w "$WF" -L 100 --json databaseId,event               --jq '[.[]|select(.event=="workflow_dispatch")|.databaseId|tostring]|join(" ")' 2>/dev/null || echo "")
+            echo "$ex" | jq -r '.exits[]? | select(.label != null)
+                                | select(.label|startswith("gh-"))
+                                | [(.label|split("|")[0]|ltrimstr("gh-")), .minted,
+                                   ((.recentAcceptPct // 0)|floor), (.recentSamples // 0)]
+                                | @tsv' > /tmp/lanef_runners.tsv 2>/dev/null || : > /tmp/lanef_runners.tsv
+            while IFS="$(printf '	')" read -r rid rmint racc rn; do
+              [ -z "${rid:-}" ] && continue
+              case "$rmint$racc$rn" in *[!0-9]*) continue ;; esac
+              case " $mine " in
+                *" $rid "*) ;;
+                *) continue ;;                 # not ours -- never touch it
+              esac
+              why=""
+              if [ "${RETIRE_TOKENS:-0}" -gt 0 ] && [ "$rmint" -ge "$RETIRE_TOKENS" ]; then
+                why="spent its budget (${rmint} >= ${RETIRE_TOKENS} tokens)"
+              elif [ "${MIN_ACCEPT_PCT:-0}" -gt 0 ] && [ "$rn" -ge "${MIN_ACCEPT_SAMPLES:-8}" ]                    && [ "$racc" -lt "$MIN_ACCEPT_PCT" ]; then
+                # The healthy-looking-runner case: still minting fine, but its
+                # tokens are being refused, so it is net-negative to the pool.
+                why="acceptance decayed (${racc}% over ${rn} verdicts < ${MIN_ACCEPT_PCT}%)"
+              fi
+              if [ -n "$why" ]; then
+                if [ "${RETIRE_DRY_RUN:-false}" = "true" ]; then
+                  echo "RETIRE(dry-run) would cancel run $rid -- $why"
+                else
+                  echo "RETIRE run $rid -- $why"
+                  gh run cancel "$rid" >/dev/null 2>&1 && retired=$(( retired + 1 ))                     || echo "  (cancel failed for $rid; next tick retries)"
+                fi
+              fi
+            done < /tmp/lanef_runners.tsv
+            rm -f /tmp/lanef_runners.tsv
+            if [ "$retired" -gt 0 ]; then
+              inflight=$(( inflight - retired )); [ "$inflight" -lt 0 ] && inflight=0
+            fi
+          fi
+
           action="hold"
           if [ "$STOP" = "1" ]; then
             action="killswitch"
@@ -425,7 +495,7 @@ jobs:
           fi
 
           scope="$PROVIDER"; [ -n "$GLOBAL_CEILING" ] && scope="ALL-PROVIDERS"
-          line="FLEET laneF enabled=$enabled action=$action | $scope TRUE rate=${vg_rate}/min (floor=$FLOOR_RATE target=$TARGET_RATE ceiling=$ceiling) exits=$p_exits accept=${p_acc}% runners=$inflight/$MAX_RUNNERS (+VM anchor ~12 in this budget) | relay queued=$queued oldest=${oldest}s"
+          line="FLEET laneF enabled=$enabled action=$action | $scope TRUE rate=${vg_rate}/min (floor=$FLOOR_RATE target=$TARGET_RATE ceiling=$ceiling) exits=$p_exits accept=${p_acc}% runners=$inflight/$MAX_RUNNERS retired=$retired (+VM anchor ~12 in this budget) | relay queued=$queued oldest=${oldest}s"
           echo "$line"; echo "$line" >> "$GITHUB_STEP_SUMMARY"
 
           case "$action" in
@@ -453,7 +523,7 @@ jobs:
           # Stagger lifetimes so the fleet does not all expire in the same
           # minute. Successors inherit `minutes` verbatim, so a stagger set here
           # persists for the life of the chain.
-          mins=$(( BASE_MIN - inflight * SPREAD_MIN - (RANDOM % 7) ))
+          mins=$(( JOB_MINUTES - inflight * SPREAD_MIN - (RANDOM % 7) ))
           [ "$mins" -lt 20 ] && mins=20
           if gh workflow run "$WF" \
                -f chain=true -f egress="$PROVIDER" \
