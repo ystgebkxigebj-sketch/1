@@ -170,6 +170,51 @@ on:
         description: "Browsers per runner. WARP's v4 is anycast so these SHARE one exit -- above 1 you are just overdriving it."
         required: false
         default: "1"
+      egress:
+        # WHY THIS EXISTS. Measured 2026-07-29 with per-exit attribution: tokens
+        # minted on a GitHub runner through WARP are accepted at ~4-5%, while the
+        # Oracle VM's tokens — same producer stack, same browser, same rates, also
+        # through WARP — are accepted at 100% in the same minutes. A single runner
+        # is no better than a fleet (1 joined / 22 refused), and mint rate makes no
+        # difference (per_min=10 and per_min=30 both collapse to 0%).
+        #
+        # The leading explanation is that WARP is Cloudflare's OWN product, so it
+        # cannot hide an untrusted origin from Cloudflare's own Turnstile: it
+        # restored *issuance* from AS8075 but not *standing* at siteverify. If that
+        # is right, no number of WARP runners will ever work and the egress has to
+        # be something Cloudflare does not operate.
+        #
+        #   warp     - control, the known-bad ~4% baseline
+        #   vpngate  - free volunteer OpenVPN relays, many RESIDENTIAL (JP/KR).
+        #              Changes the DEFAULT ROUTE, so no --proxy-server is used and
+        #              the relay POST egresses through it too (attribution still
+        #              sees the true exit). vpngate.py --index/--stride give N
+        #              runners DISJOINT relays instead of all picking the fastest.
+        #   webshare - our paid proxies. Diagnostic only: at ~0.75 MB/token, 800
+        #              tok/min would be ~25 TB/month, so this can prove the point
+        #              but cannot be the production answer.
+        #   direct   - control. Expect 600010 (Cloudflare refuses to challenge
+        #              AS8075 directly); confirms the runner itself is the problem.
+        description: "warp | vpngate | webshare | direct"
+        required: false
+        default: "warp"
+      vpngate_index:
+        # Job K of N passes index=K stride=N so concurrent runners take disjoint
+        # relays. Without it every runner ranks the feed identically, all pick the
+        # same top relay, and they collide on ONE exit — the exact failure that
+        # caps WARP's horizontal scale.
+        description: "VPN Gate: this job's slice index (0-based)"
+        required: false
+        default: "0"
+      vpngate_stride:
+        description: "VPN Gate: total number of concurrent jobs sharing the feed"
+        required: false
+        default: "1"
+      webshare_proxy:
+        # One entry, `host:port:user:pass` (the format of the proxy list files).
+        description: "webshare egress: host:port:user:pass"
+        required: false
+        default: ""
       browser:
         # cft136 mints ZERO with no `cf err` at all -- the challenge neither
         # errors nor solves, which is not the AS8075 signature (that is loud
@@ -254,6 +299,10 @@ jobs:
         env:
           FORBID: ${{ github.event.inputs.forbid_exits }}
           TUNNELS: ${{ github.event.inputs.tunnels }}
+          EGRESS: ${{ github.event.inputs.egress }}
+          VPNGATE_INDEX: ${{ github.event.inputs.vpngate_index }}
+          VPNGATE_STRIDE: ${{ github.event.inputs.vpngate_stride }}
+          WEBSHARE_PROXY: ${{ github.event.inputs.webshare_proxy }}
         run: |
           # `set +e` explicitly: GitHub invokes every step as `bash -e {0}` and
           # `set -uo pipefail` does NOT clear that. One tunnel failing to
@@ -264,11 +313,68 @@ jobs:
           # would mint nothing but 600010 for hours.
           set +e +o pipefail
           TUNNELS="${TUNNELS:-3}"
+          EGRESS="${EGRESS:-warp}"
+          : > /tmp/tunnels.txt
+
+          # tunnels.txt is `n <proxy-url-or-dash> <exit-v4> <label>`. Field 2 is a
+          # FULL proxy URL now (it used to be a bare SOCKS port), because vpngate
+          # and direct take no proxy at all and webshare needs credentials.
+          if [ "$EGRESS" != "warp" ]; then
+            case "$EGRESS" in
+              vpngate)
+                sudo apt-get install -y --no-install-recommends openvpn >/dev/null 2>&1
+                curl -fsSL -o /tmp/vpngate.csv https://www.vpngate.net/api/iphone/
+                echo 'IyEvdXNyL2Jpbi9lbnYgcHl0aG9uMwoiIiJUdXJuIHRoZSBWUE4gR2F0ZSBwdWJsaWMgcmVsYXkgbGlzdCBpbnRvIHJlYWR5LXRvLXVzZSBPcGVuVlBOIGNvbmZpZ3MuCgpWUE4gR2F0ZSAodnBuZ2F0ZS5uZXQpIHB1Ymxpc2hlcyBhIENTViBvZiB2b2x1bnRlZXItcnVuIHJlbGF5cywgZWFjaCBjYXJyeWluZwppdHMgd2hvbGUgLm92cG4gY29uZmlnIGlubGluZSBhcyBiYXNlNjQg4oCUIG5vIGFjY291bnQsIG5vIGNyZWRlbnRpYWxzLCBubyBBUEkKa2V5LiBNYW55IGV4aXRzIGFyZSByZXNpZGVudGlhbCBjb25zdW1lciBsaW5lcyAobW9zdGx5IEpQL0tSKSwgd2hpY2ggaXMgdGhlCnByb3BlcnR5IHRoYXQgYWN0dWFsbHkgbWF0dGVycyBoZXJlOiB0aGUgcGlwZWxpbmUgaGFzIG1lYXN1cmVkIHRoYXQgcmVzaWRlbnRpYWwKZXhpdHMgdG9sZXJhdGUgc29sdmUgcmF0ZXMgdGhhdCBjb2xsYXBzZSBhIGRhdGFjZW50ZXIgSVAuCgpgYC0taW5kZXhgYC9gYC0tc3RyaWRlYGAgZXhpc3Qgc28gTiBjb25jdXJyZW50IHByb2R1Y2VycyBwaWNrICoqZGlzam9pbnQqKgpyZWxheXMuIFdpdGhvdXQgdGhlbSBldmVyeSBydW5uZXIgcmFua3MgdGhlIGZlZWQgaWRlbnRpY2FsbHksIGFsbCBwaWNrIHRoZSBzYW1lCnRvcCByZWxheSwgYW5kIHRoZXkgY29sbGlkZSBvbiBvbmUgZXhpdCBJUCDigJQgdGhlIGV4YWN0IGZhaWx1cmUgdGhhdCBjYXBzIFdBUlAncwpob3Jpem9udGFsIHNjYWxlLiBKb2IgSyBvZiBOIHBhc3NlcyBgYC0taW5kZXggSyAtLXN0cmlkZSBOYGAgYW5kIHJlY2VpdmVzIHJhbmtzCkssIEsrTiwgSysyTiwg4oCmOiBkaXNqb2ludCBzZXRzLCBlYWNoIHdpdGggYSBmYWlyIHNwcmVhZCBvZiBxdWFsaXR5IHJhdGhlciB0aGFuCm9uZSBqb2IgaG9nZ2luZyBldmVyeSBmYXN0IHJlbGF5LgoKVXNhZ2U6IHZwbmdhdGUucHkgPGNzdj4gPG91dGRpcj4gWy0tY291bnQgTl0gWy0taW5kZXggS10gWy0tc3RyaWRlIFNdCldyaXRlcyA8b3V0ZGlyPi8wMC08Y291bnRyeT4tPGhvc3Q+Lm92cG4g4oCmIGJlc3QgY2FuZGlkYXRlIGZvciB0aGlzIGpvYiBmaXJzdC4KIiIiCgpmcm9tIF9fZnV0dXJlX18gaW1wb3J0IGFubm90YXRpb25zCgppbXBvcnQgYXJncGFyc2UKaW1wb3J0IGJhc2U2NAppbXBvcnQgY3N2CmltcG9ydCBpbwppbXBvcnQgc3lzCmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aAoKCmRlZiBwYXJzZV9mZWVkKHJhdzogc3RyKSAtPiBsaXN0W3R1cGxlW2ludCwgaW50LCBzdHIsIHN0ciwgc3RyXV06CiAgICAiIiJSYW5rIHVzYWJsZSByZWxheXMgYmVzdC1maXJzdCBhcyAoc3BlZWQsIC1waW5nLCBjb3VudHJ5LCBob3N0LCBjb25maWcpLiIiIgogICAgIyBUaGUgZmVlZCBpcyB3cmFwcGVkIGluICp2cG5fc2VydmVycyAvICogbWFya2VycyBhbmQgaGFzIGEgY29tbWVudGVkIGhlYWRlci4KICAgIGxpbmVzID0gW2xuIGZvciBsbiBpbiByYXcuc3BsaXRsaW5lcygpIGlmIGxuIGFuZCBub3QgbG4uc3RhcnRzd2l0aCgiKiIpXQogICAgaWYgbGluZXMgYW5kIGxpbmVzWzBdLnN0YXJ0c3dpdGgoIiMiKToKICAgICAgICBsaW5lc1swXSA9IGxpbmVzWzBdLmxzdHJpcCgiIyIpCgogICAgY2FuZGlkYXRlcyA9IFtdCiAgICBmb3Igcm93IGluIGNzdi5EaWN0UmVhZGVyKGlvLlN0cmluZ0lPKCJcbiIuam9pbihsaW5lcykpKToKICAgICAgICBlbmNvZGVkID0gKHJvdy5nZXQoIk9wZW5WUE5fQ29uZmlnRGF0YV9CYXNlNjQiKSBvciAiIikuc3RyaXAoKQogICAgICAgIGlmIG5vdCBlbmNvZGVkOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIHRyeToKICAgICAgICAgICAgY29uZmlnID0gYmFzZTY0LmI2NGRlY29kZShlbmNvZGVkKS5kZWNvZGUoInV0Zi04IiwgInJlcGxhY2UiKQogICAgICAgICAgICBzcGVlZCA9IGludChyb3cuZ2V0KCJTcGVlZCIpIG9yIDApCiAgICAgICAgICAgIHBpbmcgPSBpbnQocm93LmdldCgiUGluZyIpIG9yIDk5OTkpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgY29udGludWUKICAgICAgICAjIFJhbmsgYnkgdGhyb3VnaHB1dDogYSBzbG93IHJlbGF5IGp1c3QgdGltZXMgdGhlIHdob2xlIHJ1biBvdXQuCiAgICAgICAgY2FuZGlkYXRlcy5hcHBlbmQoKHNwZWVkLCAtcGluZywgcm93LmdldCgiQ291bnRyeVNob3J0IiwgIj8/IiksCiAgICAgICAgICAgICAgICAgICAgICAgICAgIHJvdy5nZXQoIiNIb3N0TmFtZSIpIG9yIHJvdy5nZXQoIkhvc3ROYW1lIikgb3IgImgiLAogICAgICAgICAgICAgICAgICAgICAgICAgICBjb25maWcpKQogICAgY2FuZGlkYXRlcy5zb3J0KHJldmVyc2U9VHJ1ZSkKICAgIHJldHVybiBjYW5kaWRhdGVzCgoKZGVmIG1haW4oKSAtPiBpbnQ6CiAgICBwYXJzZXIgPSBhcmdwYXJzZS5Bcmd1bWVudFBhcnNlcihkZXNjcmlwdGlvbj1fX2RvY19fKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgiY3N2IiwgdHlwZT1QYXRoKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgib3V0ZGlyIiwgdHlwZT1QYXRoKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgiLS1jb3VudCIsIHR5cGU9aW50LCBkZWZhdWx0PTYsCiAgICAgICAgICAgICAgICAgICAgICAgIGhlbHA9ImhvdyBtYW55IGNhbmRpZGF0ZXMgdG8gd3JpdGUgKGZhbGxiYWNrcyBpbmNsdWRlZCkiKQogICAgcGFyc2VyLmFkZF9hcmd1bWVudCgiLS1pbmRleCIsIHR5cGU9aW50LCBkZWZhdWx0PTEsCiAgICAgICAgICAgICAgICAgICAgICAgIGhlbHA9IjEtYmFzZWQgaW5kZXggb2YgdGhpcyBwcm9kdWNlciBhbW9uZyAtLXN0cmlkZSBwZWVycyIpCiAgICBwYXJzZXIuYWRkX2FyZ3VtZW50KCItLXN0cmlkZSIsIHR5cGU9aW50LCBkZWZhdWx0PTEsCiAgICAgICAgICAgICAgICAgICAgICAgIGhlbHA9InRvdGFsIG51bWJlciBvZiBjb25jdXJyZW50IHByb2R1Y2VycyIpCiAgICBhcmdzID0gcGFyc2VyLnBhcnNlX2FyZ3MoKQoKICAgIGlmIGFyZ3MuaW5kZXggPCAxIG9yIGFyZ3Muc3RyaWRlIDwgMSBvciBhcmdzLmluZGV4ID4gYXJncy5zdHJpZGU6CiAgICAgICAgcHJpbnQoIm5lZWQgMSA8PSBpbmRleCA8PSBzdHJpZGUiLCBmaWxlPXN5cy5zdGRlcnIpCiAgICAgICAgcmV0dXJuIDEKCiAgICBjYW5kaWRhdGVzID0gcGFyc2VfZmVlZChhcmdzLmNzdi5yZWFkX3RleHQoInV0Zi04IiwgInJlcGxhY2UiKSkKICAgIG1pbmUgPSBjYW5kaWRhdGVzW2FyZ3MuaW5kZXggLSAxOjphcmdzLnN0cmlkZV1bOmFyZ3MuY291bnRdCiAgICBpZiBub3QgbWluZToKICAgICAgICBwcmludCgibm8gdXNhYmxlIHJlbGF5cyBpbiBmZWVkIGZvciB0aGlzIGluZGV4IiwgZmlsZT1zeXMuc3RkZXJyKQogICAgICAgIHJldHVybiAxCgogICAgYXJncy5vdXRkaXIubWtkaXIocGFyZW50cz1UcnVlLCBleGlzdF9vaz1UcnVlKQogICAgZm9yIHJhbmssIChzcGVlZCwgbmVncGluZywgY291bnRyeSwgaG9zdCwgY29uZmlnKSBpbiBlbnVtZXJhdGUobWluZSk6CiAgICAgICAgcGF0aCA9IGFyZ3Mub3V0ZGlyIC8gZiJ7cmFuazowMmR9LXtjb3VudHJ5fS17aG9zdH0ub3ZwbiIKICAgICAgICAjIE5vbi1pbnRlcmFjdGl2ZTogT3BlblZQTiBtdXN0IG5ldmVyIGJsb2NrIGFza2luZyBmb3IgYSBjcmVkZW50aWFsLCBhbmQKICAgICAgICAjIGEgZGVhZCByZWxheSBtdXN0IGZhaWwgZmFzdCByYXRoZXIgdGhhbiByZXRyeSBmb3JldmVyLgogICAgICAgIHBhdGgud3JpdGVfdGV4dChjb25maWcgKyAnXG5hdXRoLW5vY2FjaGVcbnB1bGwtZmlsdGVyIGlnbm9yZSAiYXV0aC10b2tlbiJcbicsCiAgICAgICAgICAgICAgICAgICAgICAgICJ1dGYtOCIpCiAgICAgICAgcHJpbnQoZiJ7cGF0aC5uYW1lfSBzcGVlZD17c3BlZWQvMWU2Oi4xZn1NYnBzIHBpbmc9ey1uZWdwaW5nfW1zICIKICAgICAgICAgICAgICBmImNvdW50cnk9e2NvdW50cnl9IiwgZmlsZT1zeXMuc3RkZXJyKQoKICAgIHByaW50KGYicG9vbD17bGVuKGNhbmRpZGF0ZXMpfSBpbmRleD17YXJncy5pbmRleH0ve2FyZ3Muc3RyaWRlfSAiCiAgICAgICAgICBmIndyaXR0ZW49e2xlbihtaW5lKX0iLCBmaWxlPXN5cy5zdGRlcnIpCiAgICByZXR1cm4gMAoKCmlmIF9fbmFtZV9fID09ICJfX21haW5fXyI6CiAgICBzeXMuZXhpdChtYWluKCkpCg==' | base64 -d > /tmp/vpngate.py
+                python3 /tmp/vpngate.py /tmp/vpngate.csv /tmp/vpn \
+                  --index "${VPNGATE_INDEX:-0}" --stride "${VPNGATE_STRIDE:-1}"
+                before=$(curl -4 -s --max-time 10 https://api.ipify.org)
+                echo "egress_before=$before"
+                ok=""
+                for cfg in /tmp/vpn/*.ovpn; do
+                  echo "--- trying $(basename "$cfg") ---"
+                  sudo openvpn --config "$cfg" --daemon --log /tmp/ovpn.log \
+                    --connect-timeout 15 --connect-retry-max 1 || continue
+                  for i in $(seq 1 20); do
+                    now=$(curl -4 -s --max-time 5 https://api.ipify.org || true)
+                    if [ -n "$now" ] && [ "$now" != "$before" ]; then ok="$now"; break; fi
+                    sleep 2
+                  done
+                  [ -n "$ok" ] && break
+                  sudo pkill openvpn; sleep 2
+                done
+                [ -n "$ok" ] || { echo "::error::no VPN Gate relay came up"; tail -20 /tmp/ovpn.log; exit 1; }
+                echo "vpn_egress=$ok"
+                curl -s --max-time 15 "https://ipinfo.io/${ok}/json" | tr -d '\n'; echo
+                # Default route IS the tunnel, so no --proxy-server.
+                echo "0 - $ok vpngate" >> /tmp/tunnels.txt
+                ;;
+              webshare)
+                IFS=':' read -r wh wp wu wpw <<< "$WEBSHARE_PROXY"
+                [ -n "$wh" ] || { echo "::error::webshare_proxy required"; exit 1; }
+                PURL="http://$wu:$wpw@$wh:$wp"
+                ip=$(curl -4 -s --max-time 20 --proxy "$PURL" https://api.ipify.org)
+                [ -n "$ip" ] || { echo "::error::webshare proxy unreachable"; exit 1; }
+                echo "webshare_egress=$ip"
+                echo "0 $PURL $ip webshare" >> /tmp/tunnels.txt
+                ;;
+              direct)
+                ip=$(curl -4 -s --max-time 15 https://api.ipify.org)
+                echo "direct_egress=$ip (expect Cloudflare 600010 on AS8075)"
+                echo "0 - $ip direct" >> /tmp/tunnels.txt
+                ;;
+              *) echo "::error::unknown egress $EGRESS"; exit 1 ;;
+            esac
+            UP=$(wc -l < /tmp/tunnels.txt)
+            echo "TUNNELS_UP=$UP" >> "$GITHUB_ENV"
+            echo "EXITIP=$(awk 'NR==1{print $3}' /tmp/tunnels.txt)" >> "$GITHUB_ENV"
+            echo "egress=$EGRESS up=$UP"
+            exit 0
+          fi
+
           mkdir -p /tmp/warp && cd /tmp/warp
           echo 'IyEvdXNyL2Jpbi9lbnYgYmFzaAojIEJyaW5nIHVwIENsb3VkZmxhcmUgV0FSUCBhcyBhIGxvY2FsIFNPQ0tTNSBsaXN0ZW5lciwgcmVwb3J0IHRoZSBleGl0LCBhbmQKIyByZWZ1c2UgdG8gaGFuZCBiYWNrIGEgdHVubmVsIHdob3NlIGV4aXQgY29sbGlkZXMgd2l0aCBvbmUgYWxyZWFkeSBpbiB1c2UuCiMKIyBTaGFyZWQgYnkgdGhlIGV4aXQtY2hhcmFjdGVyaXNhdGlvbiBwcm9iZSBhbmQgdGhlIHByb2R1Y3Rpb24gcHJvZHVjZXJzLCBzbyBhbGwKIyBvZiB0aGVtIGFyZSBndWFyYW50ZWVkIHRvIG1lYXN1cmUgdGhlIHNhbWUgdGhpbmcuCiMKIyBVc2FnZTogd2FycF91cC5zaCA8YmluZF9wb3J0PiBbZW5kcG9pbnRfaG9zdF0gW2VuZHBvaW50X3BvcnRdCiMKIyBFbnZpcm9ubWVudDoKIyAgIFdBUlBfRk9SQklEX0VYSVRTICBjb21tYS1zZXBhcmF0ZWQgZXhpdCBJUHMgb3IgSVAgcHJlZml4ZXMgdG8gcmVqZWN0LCBlLmcuCiMgICAgICAgICAgICAgICAgICAgICAgIjEwNC4yOC4xOTYuNzksMTA0LjI4LjIyMS4iIEEgcHJlZml4IGVuZGluZyBpbiAnLicKIyAgICAgICAgICAgICAgICAgICAgICBtYXRjaGVzIGJ5IHByZWZpeC4gT24gYSBtYXRjaCB0aGUgdHVubmVsIGlzIHRvcm4gZG93biBhbmQKIyAgICAgICAgICAgICAgICAgICAgICBhIEZSRVNIIHJlZ2lzdHJhdGlvbiBpcyBhdHRlbXB0ZWQuCiMgICBXQVJQX01BWF9ST0xMUyAgICAgaG93IG1hbnkgcmVnaXN0cmF0aW9ucyB0byB0cnkgYmVmb3JlIGdpdmluZyB1cCAoZGVmYXVsdCA0KQojCiMgV2h5IHRoZSBmb3JiaWQgbGlzdCBleGlzdHM6IFR1cm5zdGlsZSBzb2x2ZS1yYXRlIGlzIGNhcHBlZCBwZXIgZXhpdCBJUCwgbm90IHBlcgojIG1hY2hpbmUuIFR3byBwcm9kdWNlcnMgYmVoaW5kIG9uZSBleGl0IGlzIG1lYXN1cmFibHkgZmF0YWwg4oCUIG9uZSBzdXN0YWlucyB+NDkKIyB0b2svbWluIHdoaWxlIHRoZSBvdGhlciBnZXRzIG5vdGhpbmcgYnV0IENsb3VkZmxhcmUgMzAwMDMwLiBUd28gcnVubmVycyBkcmF3aW5nCiMgdGhlIHNhbWUgYW55Y2FzdCBleGl0IGlzIG5vdCBoeXBvdGhldGljYWw7IGl0IHdhcyBvYnNlcnZlZC4gU28gYW55IHNlY29uZAojIHByb2R1Y2VyLCBpbiB0aGlzIGxhbmUgb3IgYW5vdGhlciAodGhlIE9yYWNsZSBWTSBsYW5lIGFsc28gdXNlcyBXQVJQKSwgbXVzdCBiZQojIHRvbGQgd2hpY2ggZXhpdHMgYXJlIHRha2VuIGFuZCBkZWNsaW5lIHRoZW0uCiMKIyBQcmludHMgYGtleT12YWx1ZWAgbGluZXMgYW5kIGxlYXZlcyB3aXJlcHJveHkgcnVubmluZyBpbiB0aGUgYmFja2dyb3VuZC4gRXhpdHMKIyBub24temVybyBpZiBubyBhY2NlcHRhYmxlIHR1bm5lbCBjb3VsZCBiZSBlc3RhYmxpc2hlZCDigJQgY2FsbGVycyBNVVNUIHRyZWF0CiMgdGhhdCBhcyBmYXRhbCwgYmVjYXVzZSBmYWxsaW5nIHRocm91Z2ggdG8gdGhlIHJ1bm5lcidzIG93biBlZ3Jlc3MgbWVhbnMgbWludGluZwojIGZyb20gQVM4MDc1LCB3aGljaCB5aWVsZHMgbm90aGluZyBidXQgQ2xvdWRmbGFyZSA2MDAwMTAuCnNldCAtZXVvIHBpcGVmYWlsCgpCSU5EX1BPUlQ9IiR7MTo/YmluZCBwb3J0IHJlcXVpcmVkfSIKRU5EUE9JTlRfSE9TVD0iJHsyOi19IgpFTkRQT0lOVF9QT1JUPSIkezM6LX0iCkZPUkJJRD0iJHtXQVJQX0ZPUkJJRF9FWElUUzotfSIKTUFYX1JPTExTPSIke1dBUlBfTUFYX1JPTExTOi00fSIKCiMgVGhlIHJlbGVhc2UgQ0ROIDUwNHMgaW4gYnVyc3RzIHRoYXQgb3V0bGFzdCBhbnkgY3VybCAtLXJldHJ5IGJ1ZGdldC4KZGwoKSB7CiAgZm9yIGF0dGVtcHQgaW4gMSAyIDMgNCA1IDY7IGRvCiAgICBjdXJsIC1mc1NMIC0tcmV0cnkgMyAtLXJldHJ5LWRlbGF5IDMgLS1yZXRyeS1hbGwtZXJyb3JzIFwKICAgICAgLS1jb25uZWN0LXRpbWVvdXQgMjAgLW8gIiQyIiAiJDEiICYmIHJldHVybiAwCiAgICBlY2hvICJkb3dubG9hZCBhdHRlbXB0ICRhdHRlbXB0IGZvciAkMiBmYWlsZWQ7IGJhY2tpbmcgb2ZmIiA+JjIKICAgIHNsZWVwICQoKCBhdHRlbXB0ICogOCApKQogIGRvbmUKICByZXR1cm4gMQp9CgppZiBbWyAhIC14IC4vd2djZiBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9WaVJiMy93Z2NmL3JlbGVhc2VzL2Rvd25sb2FkL3YyLjIuMzIvd2djZl8yLjIuMzJfbGludXhfYW1kNjQgd2djZgogIGNobW9kICt4IHdnY2YKZmkKaWYgW1sgISAteCAuL3dpcmVwcm94eSBdXTsgdGhlbgogIGRsIGh0dHBzOi8vZ2l0aHViLmNvbS9wdWZmZXJmZmlzaC93aXJlcHJveHkvcmVsZWFzZXMvZG93bmxvYWQvdjEuMS4zL3dpcmVwcm94eV9saW51eF9hbWQ2NC50YXIuZ3ogd2lyZXByb3h5LnRhci5negogIHRhciB4emYgd2lyZXByb3h5LnRhci5negpmaQoKIyBEb2VzICQxIG1hdGNoIGFueSBlbnRyeSBpbiB0aGUgY29tbWEtc2VwYXJhdGVkICRGT1JCSUQgbGlzdD8gQW4gZW50cnkgZW5kaW5nCiMgaW4gJy4nIGlzIHRyZWF0ZWQgYXMgYSBwcmVmaXggc28gYSB3aG9sZSAvMjQtaXNoIGJsb2NrIGNhbiBiZSByZXNlcnZlZC4KaXNfZm9yYmlkZGVuKCkgewogIGxvY2FsIGlwPSIkMSIgZW50cnkKICBbWyAteiAiJEZPUkJJRCIgXV0gJiYgcmV0dXJuIDEKICBsb2NhbCBJRlM9JywnCiAgZm9yIGVudHJ5IGluICRGT1JCSUQ7IGRvCiAgICBlbnRyeT0iJHtlbnRyeS8vIC99IgogICAgW1sgLXogIiRlbnRyeSIgXV0gJiYgY29udGludWUKICAgIGlmIFtbICIkZW50cnkiID09ICouIF1dOyB0aGVuCiAgICAgIFtbICIkaXAiID09ICIkZW50cnkiKiBdXSAmJiByZXR1cm4gMAogICAgZWxzZQogICAgICBbWyAiJGlwIiA9PSAiJGVudHJ5IiBdXSAmJiByZXR1cm4gMAogICAgZmkKICBkb25lCiAgcmV0dXJuIDEKfQoKZXhpdF9pcD0iIjsgY29sbz0iIjsgd2FycD0iIjsgbG9jPSIiOyByb2xsPTA7IHdwX3BpZD0iIgp3aGlsZSAoKCByb2xsIDwgTUFYX1JPTExTICkpOyBkbwogIHJvbGw9JCgoIHJvbGwgKyAxICkpCiAgIyBLaWxsIG9ubHkgdGhlIHdpcmVwcm94eSBUSElTIGludm9jYXRpb24gc3RhcnRlZC4gSXQgdXNlZCB0byBiZQogICMgYHBraWxsIC1mICd3aXJlcHJveHkgLWMnYCwgd2hpY2gga2lsbGVkIGV2ZXJ5IHdpcmVwcm94eSBvbiB0aGUgYm94IC0tIGZpbmUKICAjIHdoZW4gb25lIHR1bm5lbCBleGlzdGVkLCBmYXRhbCBvbmNlIGEgY2FsbGVyIHJ1bnMgc2V2ZXJhbCBzaWRlIGJ5IHNpZGUgdG8KICAjIGdldCBzZXZlcmFsIGV4aXQgSVBzLCBiZWNhdXNlIGVhY2ggbmV3IHJvbGwgdG9yZSBkb3duIGl0cyBzaWJsaW5ncy4KICAjIGB8fCB0cnVlYCBpcyBsb2FkLWJlYXJpbmc6IHRoaXMgc2NyaXB0IHJ1bnMgdW5kZXIgYHNldCAtZWAsIGFuZCBraWxsaW5nIGEKICAjIHdpcmVwcm94eSB0aGF0IGhhcyBhbHJlYWR5IGRpZWQgcmV0dXJucyBub24temVybywgd2hpY2ggd291bGQgYWJvcnQgdGhlCiAgIyB3aG9sZSByb2xsIGxvb3AuIFRoZSBgcGtpbGwgLi4uIHx8IHRydWVgIHRoaXMgcmVwbGFjZWQgaGFkIHRoZSBzYW1lIGd1YXJkLgogIGlmIFtbIC1uICIkd3BfcGlkIiBdXTsgdGhlbiBraWxsICIkd3BfcGlkIiAyPi9kZXYvbnVsbCB8fCB0cnVlOyBmaQogIHdwX3BpZD0iIgogIHNsZWVwIDEKCiAgIyBBIGZyZXNoIGFub255bW91cyByZWdpc3RyYXRpb24gZWFjaCByb2xsOiBubyBzaWdudXAsIG5vIGNyZWRlbnRpYWxzLiBEZWxldGluZwogICMgdGhlIGFjY291bnQgZmlsZSBpcyB3aGF0IG1ha2VzIGl0IGZyZXNoIHJhdGhlciB0aGFuIHJldXNlZC4KICBybSAtZiB3Z2NmLWFjY291bnQudG9tbCB3Z2NmLXByb2ZpbGUuY29uZgogIC4vd2djZiByZWdpc3RlciAtLWFjY2VwdC10b3MgPi9kZXYvbnVsbAogIC4vd2djZiBnZW5lcmF0ZSA+L2Rldi9udWxsCgogIGNwIHdnY2YtcHJvZmlsZS5jb25mIHdwLmNvbmYKICBpZiBbWyAtbiAiJEVORFBPSU5UX0hPU1QiIF1dOyB0aGVuCiAgICBzZWQgLWkgInN8XkVuZHBvaW50ICo9Lip8RW5kcG9pbnQgPSAke0VORFBPSU5UX0hPU1R9OiR7RU5EUE9JTlRfUE9SVDotMjQwOH18IiB3cC5jb25mCiAgZmkKICBwcmludGYgJ1xuW1NvY2tzNV1cbkJpbmRBZGRyZXNzID0gMTI3LjAuMC4xOiVzXG4nICIkQklORF9QT1JUIiA+PiB3cC5jb25mCiAgLi93aXJlcHJveHkgLWMgd3AuY29uZiA+d2lyZXByb3h5LmxvZyAyPiYxICYKICB3cF9waWQ9JCEKCiAgZm9yIF8gaW4gJChzZXEgMSAzMCk7IGRvCiAgICBjdXJsIC1zIC0tbWF4LXRpbWUgNSAtLXNvY2tzNS1ob3N0bmFtZSAiMTI3LjAuMC4xOiRCSU5EX1BPUlQiIFwKICAgICAgaHR0cHM6Ly93d3cuY2xvdWRmbGFyZS5jb20vY2RuLWNnaS90cmFjZSA+L2Rldi9udWxsIDI+JjEgJiYgYnJlYWsKICAgIHNsZWVwIDIKICBkb25lCgogIHRyYWNlPSQoY3VybCAtcyAtLW1heC10aW1lIDIwIC0tc29ja3M1LWhvc3RuYW1lICIxMjcuMC4wLjE6JEJJTkRfUE9SVCIgXAogICAgaHR0cHM6Ly93d3cuY2xvdWRmbGFyZS5jb20vY2RuLWNnaS90cmFjZSB8fCB0cnVlKQogIGV4aXRfaXA9JChwcmludGYgJyVzJyAiJHRyYWNlIiB8IHNlZCAtbiAncy9eaXA9Ly9wJykKICBjb2xvPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXmNvbG89Ly9wJykKICB3YXJwPSQocHJpbnRmICclcycgIiR0cmFjZSIgfCBzZWQgLW4gJ3MvXndhcnA9Ly9wJykKICBsb2M9JChwcmludGYgJyVzJyAiJHRyYWNlIiB8IHNlZCAtbiAncy9ebG9jPS8vcCcpCiAgIyBXQVJQIGlzIGR1YWwgc3RhY2sgYW5kIGNkbi1jZ2kvdHJhY2UgcmVwb3J0cyB3aGljaGV2ZXIgZmFtaWx5IHRoZSByZXF1ZXN0CiAgIyB1c2VkIOKAlCBvdmVyIFdBUlAgdGhhdCBpcyBJUHY2LiBCb3RoIGhhdmUgdG8gYmUgY2FwdHVyZWQ6IHRoZSB2NCBhZGRyZXNzIGlzCiAgIyB3aGF0IGVhcmxpZXIgY29sbGlzaW9ucyB3ZXJlIHJlY29yZGVkIGFzLCBhbmQgZWl0aGVyIGZhbWlseSBjYW4gYmUgdGhlIG9uZQogICMgYSBwZWVyIGxhbmUgaGFzIGFscmVhZHkgY2xhaW1lZC4KICBleGl0X3Y0PSQoY3VybCAtNCAtcyAtLW1heC10aW1lIDE1IC0tc29ja3M1LWhvc3RuYW1lICIxMjcuMC4wLjE6JEJJTkRfUE9SVCIgXAogICAgaHR0cHM6Ly9hcGkuaXBpZnkub3JnIHx8IHRydWUpCiAgZWNobyAicm9sbD0kcm9sbCBleGl0X2lwPSR7ZXhpdF9pcDotRkFJTEVEfSBleGl0X3Y0PSR7ZXhpdF92NDotbm9uZX0gY29sbz0ke2NvbG86LXVua25vd259IHdhcnA9JHt3YXJwOi11bmtub3dufSIKCiAgaWYgW1sgLXogIiRleGl0X2lwIiB8fCAiJHdhcnAiICE9ICJvbiIgXV07IHRoZW4KICAgIGVjaG8gIiAgdHVubmVsIGRpZCBub3QgY29tZSB1cCBvbiByb2xsICRyb2xsIiA+JjIKICAgIGNvbnRpbnVlCiAgZmkKICBpZiBpc19mb3JiaWRkZW4gIiRleGl0X2lwIiB8fCB7IFtbIC1uICIkZXhpdF92NCIgXV0gJiYgaXNfZm9yYmlkZGVuICIkZXhpdF92NCI7IH07IHRoZW4KICAgIGVjaG8gIiAgZXhpdCAke2V4aXRfdjQ6LSRleGl0X2lwfSBpcyBpbiBXQVJQX0ZPUkJJRF9FWElUUyDigJQgcmUtcm9sbGluZyIgPiYyCiAgICBleGl0X2lwPSIiCiAgICBjb250aW51ZQogIGZpCiAgYnJlYWsKZG9uZQoKZWNobyAiZW5kcG9pbnRfdXNlZD0kKGdyZXAgLUUgJ15FbmRwb2ludCcgd3AuY29uZiB8IGhlYWQgLTEgfCBzZWQgJ3MvLio9ICovLycpIgplY2hvICJleGl0X2lwPSR7ZXhpdF9pcDotRkFJTEVEfSIKZWNobyAiZXhpdF92ND0ke2V4aXRfdjQ6LW5vbmV9IgplY2hvICJjb2xvPSR7Y29sbzotdW5rbm93bn0iCmVjaG8gIndhcnA9JHt3YXJwOi11bmtub3dufSIKZWNobyAibG9jPSR7bG9jOi11bmtub3dufSIKZWNobyAicm9sbHNfdXNlZD0kcm9sbCIKCmlmIFtbIC16ICIkZXhpdF9pcCIgfHwgIiR3YXJwIiAhPSAib24iIF1dOyB0aGVuCiAgZWNobyAibm8gYWNjZXB0YWJsZSBXQVJQIGV4aXQgYWZ0ZXIgJHJvbGwgcm9sbHMgKGZvcmJpZD0nJEZPUkJJRCcpIiA+JjIKICB0YWlsIC0yMCB3aXJlcHJveHkubG9nID4mMiB8fCB0cnVlCiAgZXhpdCAxCmZpCg==' | base64 -d > warp_up.sh
           chmod +x warp_up.sh
 
-          : > /tmp/tunnels.txt
           # Claimed exits are deliberately NOT added to the forbid list. WARP's
           # IPv4 is anycast and a runner pins to ONE: run 30347933726 rolled five
           # fresh registrations and drew 104.28.196.79 every time, only the IPv6
@@ -299,7 +405,7 @@ jobs:
             v6=$(sed -n 's/^exit_ip=//p'  "$d/out.txt" | tail -1)
             colo=$(sed -n 's/^colo=//p'   "$d/out.txt" | tail -1)
             if [ -n "$v4" ] && [ "$v4" != "none" ] && [ "$v4" != "FAILED" ]; then
-              echo "$n $port $v4 ${colo:-unknown}" >> /tmp/tunnels.txt
+              echo "$n socks5://127.0.0.1:$port $v4 ${colo:-unknown}" >> /tmp/tunnels.txt
               echo "tunnel $n  port=$port  exit=$v4  colo=${colo:-unknown}  v6=${v6:-none}"
             else
               echo "tunnel $n FAILED to register (rc=$rc) -- continuing with fewer"
@@ -329,8 +435,14 @@ jobs:
           go build -o /tmp/joinverify .
           # A verifier that cannot answer REJECTED for an obviously bogus token
           # is measuring itself, not gartic.
-          /tmp/joinverify -proxy "socks5://127.0.0.1:$SOCKS_PORT" '1.AAAAAAAAAAAA.BBBBBBBB' \
-            | sed 's/^/selftest(bogus token, expect REJECTED code=5): /'
+          SELFPX=$(awk 'NR==1{print $2}' /tmp/tunnels.txt)
+          if [ "$SELFPX" = "-" ] || [ -z "$SELFPX" ]; then
+            /tmp/joinverify '1.AAAAAAAAAAAA.BBBBBBBB' \
+              | sed 's/^/selftest(bogus token, expect REJECTED code=5): /'
+          else
+            /tmp/joinverify -proxy "$SELFPX" '1.AAAAAAAAAAAA.BBBBBBBB' \
+              | sed 's/^/selftest(bogus token, expect REJECTED code=5): /'
+          fi
 
       - name: 5. Write the MV3 extension
         env:
@@ -696,21 +808,25 @@ jobs:
           # Chrome >=137 ignores --load-extension without it.
           IDX=(); PIDS=(); PORTS=(); LOGS=()
           for t in "${TUNS[@]}"; do
-            set -- $t; n=$1; port=$2; v4=$3; colo=$4
+            set -- $t; n=$1; purl=$2; v4=$3; colo=$4
             log="/tmp/chrome-$n.log"; : > "$log"; : > "/tmp/clicks-$n.log"
+            # vpngate and direct move the DEFAULT ROUTE, so they take no
+            # --proxy-server at all; warp and webshare pass a full proxy URL.
+            pxarg=()
+            [ "$purl" != "-" ] && pxarg=(--proxy-server="$purl")
             DISPLAY=":$(( 97 + n ))" "$CHROME_BIN" \
               --no-sandbox --disable-gpu --no-first-run --no-default-browser-check \
               --disable-dev-shm-usage \
               --user-data-dir="/tmp/chrome-profile-$n" \
               --window-position=0,0 --window-size=1280,880 \
-              --proxy-server="socks5://127.0.0.1:$port" \
+              "${pxarg[@]}" \
               --disable-features=DisableLoadExtensionCommandLineSwitch \
               --disable-extensions-except=/tmp/ext \
               --load-extension=/tmp/ext \
               --enable-logging=stderr --v=0 \
               "https://gartic.io/" >> "$log" 2>&1 &
-            IDX+=("$n"); PIDS+=($!); PORTS+=("$port"); LOGS+=("$log")
-            echo "instance $n -> display :$(( 97 + n ))  socks $port  exit $v4 ($colo)"
+            IDX+=("$n"); PIDS+=($!); PORTS+=("$purl"); LOGS+=("$log")
+            echo "instance $n -> display :$(( 97 + n ))  proxy ${purl}  exit $v4 ($colo)"
           done
 
           # Fail loudly only if NO instance ran the extension -- that is a
@@ -862,7 +978,8 @@ jobs:
                 # production was down.
                 # Real acceptance, per minting exit:
                 #   https://mohanadino.duckdns.org:8443/stats/exits
-                V=$(/tmp/joinverify -proxy "socks5://127.0.0.1:$vport" "$TOK" 2>&1 | tail -1)
+                if [ "$vport" = "-" ]; then V=$(/tmp/joinverify "$TOK" 2>&1 | tail -1)
+                else V=$(/tmp/joinverify -proxy "$vport" "$TOK" 2>&1 | tail -1); fi
                 verified=$(( verified + 1 ))
                 case "$V" in JOINED*) accepted=$(( accepted + 1 ));; esac
                 # solve=int means this token came from a challenge that escalated
