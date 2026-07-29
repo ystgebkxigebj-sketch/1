@@ -729,19 +729,28 @@ jobs:
               // and burning 57% CPU. A generation counter makes every stale
               // callback a no-op, so exactly one rebuild follows each recycle.
               var gen = 0;
+              var CAP = LANES * 3;              // hard ceiling on live widgets
               var slot, id, sawInter;
-              function purge() {
-                var olds = document.querySelectorAll('div[id^="prod_' + i + '_"]');
+              function purge(sel) {
+                var olds = document.querySelectorAll(sel);
                 for (var k = 0; k < olds.length; k++) {
                   var wid = olds[k].getAttribute('data-wid');
                   if (wid) { try { window.turnstile.remove(wid); } catch (e) {} }
                   if (olds[k].parentNode) olds[k].parentNode.removeChild(olds[k]);
                 }
+                return olds.length;
               }
+              function mine() { return 'div[id^="prod_' + i + '_"]'; }
               function build() {
                 var myGen = gen;
                 sawInter = false;
-                purge();
+                purge(mine());
+                var live = document.querySelectorAll('div[id^="prod_"]').length;
+                if (live >= CAP) {
+                  log('FORKBOMB cap=' + CAP + ' live=' + live + ' lane=' + i +
+                      ' -- purging every lane and rebuilding');
+                  purge('div[id^="prod_"]');
+                }
                 slot = document.createElement('div');
                 slot.id = 'prod_' + i + '_' + myGen;
                 // The class off-the-shelf Turnstile helpers look for. Our own
@@ -831,7 +840,7 @@ jobs:
                 if (myGen !== gen) return;      // someone already recycled this gen
                 gen++;                          // invalidates every pending callback
                 try { window.turnstile.remove(id); } catch(e){}
-                purge();
+                purge(mine());
                 slot = null; id = null;
                 setTimeout(build, 400);
               }
