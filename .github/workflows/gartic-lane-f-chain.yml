@@ -316,11 +316,24 @@ jobs:
           ENABLED_CTX: ${{ vars.FLEET_ENABLED }}
           RELAY: https://mohanadino.duckdns.org:8443
           RELAY_SECRET: 74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434
-          # ── VPN Gate provider budget ──
-          TARGET_RATE: "75"      # aim here
-          CEILING_RATE: "90"     # measured cliff; never cross it
-          FLOOR_RATE: "60"       # only add a runner below this (hysteresis)
-          MAX_RUNNERS: "4"       # ~20-25 mint/min each. DO NOT RAISE. See above.
+          # ── PROVIDER BUDGET. All rates are TRUE tok/min (minted deltas). ──
+          # PROVIDER selects the jq fold below. Adding/switching a provider is a
+          # config change here, not a rewrite of the control loop.
+          PROVIDER: "warp"
+          TARGET_RATE: "45"      # aim here; headroom beats the last few tokens
+          CEILING_RATE: "55"     # Lane A brackets the cliff at 55-60 true
+          FLOOR_RATE: "35"       # only add a runner below this (hysteresis)
+          # ~12 TRUE tok/min per runner, and the VM anchor already contributes
+          # ~12 against this SAME budget, so 45/min is about 3 runners + the VM.
+          # DO NOT RAISE: past the ceiling the whole provider drops toward 0% and,
+          # because the relay serves newest-first, the refused tokens crowd out
+          # the good ones -- so raising this yields FEWER accepted tokens.
+          MAX_RUNNERS: "3"
+          # If providers turn out NOT to be independent (Lane B is driving VPN
+          # Gate through its cliff while WARP produces), set this to a number and
+          # the loop caps TOTAL pipeline output instead of one provider. That is
+          # the only change required -- the add/hold/shed logic is untouched.
+          GLOBAL_CEILING: ""
           INDEX_BASE: "14"
           STRIDE: "16"
           BASE_MIN: "300"
@@ -349,20 +362,36 @@ jobs:
             0|false|no|off) STOP=1 ;; *) STOP=0 ;;
           esac
 
+          # Provider fold. warp = the Cloudflare WARP anycast /16, which now covers
+          # BOTH the VM anchor and the GitHub runners on WARP egress -- they are
+          # one provider sharing one budget. vpngate = everything else.
+          case "$PROVIDER" in
+            warp)    SEL='select(.src|startswith("104.28."))' ;;
+            vpngate) SEL='select((.src|startswith("104.28."))|not)' ;;
+            *)       SEL='select(.)' ;;
+          esac
+          [ -n "$GLOBAL_CEILING" ] && SEL='select(.)'      # cap the whole pipeline
+
+          # TRUE rate: two samples of cumulative `minted`, 60 s apart.
+          # NEVER build this loop on `mintPerMin` -- it was inflating 1.5-1.95x
+          # (trimTimes compacted in place without assigning back, so merely
+          # READING the endpoint corrupted its own state). A control loop must
+          # not depend on a number that a reader can poison.
+          snap() { curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits"                    | jq -r "[.exits[]?|$SEL|.minted]|add // 0" 2>/dev/null || echo 0; }
+          m0=$(snap); sleep 60; m1=$(snap)
+          case "$m0" in ''|*[!0-9]*) m0=0 ;; esac
+          case "$m1" in ''|*[!0-9]*) m1=0 ;; esac
+          rate=$(( m1 - m0 )); [ "$rate" -lt 0 ] && rate=0     # relay restart
+
           ex=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits" || echo '{}')
           st=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats"       || echo '{}')
+          p_exits=$(echo "$ex" | jq -r "[.exits[]?|$SEL]|map(select(.mintPerMin>0))|length" 2>/dev/null || echo 0)
+          p_acc=$(echo "$ex"   | jq -r "[.exits[]?|$SEL]|map(select(.mintPerMin>0)|.recentAcceptPct)|if length>0 then (add/length|floor) else \"n/a\" end" 2>/dev/null || echo '?')
+          queued=$(echo "$st"  | jq -r '.queued // "?"')
+          oldest=$(echo "$st"  | jq -r 'if .oldestAgeMs then (.oldestAgeMs/1000|floor) else "?" end')
 
-          # Provider fold, matching Lane A's providers.tsv: 104.28.x is
-          # Cloudflare WARP (the VM's own exit, its own separate budget);
-          # everything else on this relay is VPN Gate via GitHub.
-          vg='[.exits[]?|select((.src|startswith("104.28."))|not)]'
-          vg_rate=$(echo "$ex"  | jq -r "$vg|map(.mintPerMin)|add // 0" 2>/dev/null || echo 0)
-          vg_exits=$(echo "$ex" | jq -r "$vg|map(select(.mintPerMin>0))|length" 2>/dev/null || echo 0)
-          vg_acc=$(echo "$ex"   | jq -r "$vg|map(select(.mintPerMin>0)|.recentAcceptPct)|if length>0 then (add/length|floor) else \"n/a\" end" 2>/dev/null || echo '?')
-          warp_rate=$(echo "$ex"| jq -r '[.exits[]?|select(.src|startswith("104.28."))|.mintPerMin]|add // 0' 2>/dev/null || echo 0)
-          queued=$(echo "$st"   | jq -r '.queued // "?"')
-          oldest=$(echo "$st"   | jq -r 'if .oldestAgeMs then (.oldestAgeMs/1000|floor) else "?" end')
-          case "$vg_rate" in ''|*[!0-9]*) vg_rate=0 ;; esac
+          ceiling="$CEILING_RATE"; [ -n "$GLOBAL_CEILING" ] && ceiling="$GLOBAL_CEILING"
+          vg_rate="$rate"
 
           inflight=$(gh run list -w "$WF" -L 100 --json status,event \
             --jq '[.[]|select(.event=="workflow_dispatch" and (.status=="in_progress" or .status=="queued"))]|length' 2>/dev/null || echo 0)
@@ -373,14 +402,15 @@ jobs:
           action="hold"
           if [ "$STOP" = "1" ]; then
             action="killswitch"
-          elif [ "$vg_rate" -ge "$CEILING_RATE" ]; then
+          elif [ "$vg_rate" -ge "$ceiling" ]; then
             action="shed"
           elif [ "$vg_rate" -lt "$FLOOR_RATE" ] && [ "$inflight" -lt "$MAX_RUNNERS" ]; then
             action="add"
             [ "$allq" -ge 3 ] && action="hold(queue=$allq)"
           fi
 
-          line="FLEET laneF enabled=$enabled action=$action | vpngate rate=${vg_rate}/min (floor=$FLOOR_RATE target=$TARGET_RATE ceiling=$CEILING_RATE) exits=$vg_exits accept=${vg_acc}% runners=$inflight/$MAX_RUNNERS | warp rate=${warp_rate}/min | relay queued=$queued oldest=${oldest}s"
+          scope="$PROVIDER"; [ -n "$GLOBAL_CEILING" ] && scope="ALL-PROVIDERS"
+          line="FLEET laneF enabled=$enabled action=$action | $scope TRUE rate=${vg_rate}/min (floor=$FLOOR_RATE target=$TARGET_RATE ceiling=$ceiling) exits=$p_exits accept=${p_acc}% runners=$inflight/$MAX_RUNNERS (+VM anchor ~12 in this budget) | relay queued=$queued oldest=${oldest}s"
           echo "$line"; echo "$line" >> "$GITHUB_STEP_SUMMARY"
 
           case "$action" in
@@ -392,7 +422,7 @@ jobs:
               victim=$(gh run list -w "$WF" -L 100 --json databaseId,status,event,createdAt \
                 --jq '[.[]|select(.event=="workflow_dispatch" and .status=="in_progress")]|sort_by(.createdAt)|last|.databaseId' 2>/dev/null || echo "")
               if [ -n "$victim" ] && [ "$victim" != "null" ]; then
-                echo "rate ${vg_rate} >= ceiling ${CEILING_RATE} — cancelling newest worker $victim"
+                echo "TRUE rate ${vg_rate} >= ceiling ${ceiling} — cancelling newest worker $victim"
                 gh run cancel "$victim" || echo "cancel failed; next tick retries"
               else
                 echo "rate over ceiling but no worker of ours to shed (another lane is producing)"
@@ -411,11 +441,11 @@ jobs:
           mins=$(( BASE_MIN - inflight * SPREAD_MIN - (RANDOM % 7) ))
           [ "$mins" -lt 20 ] && mins=20
           if gh workflow run "$WF" \
-               -f chain=true -f egress=vpngate \
+               -f chain=true -f egress="$PROVIDER" \
                -f vpngate_index="$idx" -f vpngate_stride="$STRIDE" \
                -f minutes="$mins" -f per_min=12 -f lanes=2 \
                -f post_to_relay=true -f strip_dom=true; then
-            echo "rate ${vg_rate} < floor ${FLOOR_RATE} — added runner (index=$idx minutes=$mins), now $((inflight+1))/$MAX_RUNNERS"
+            echo "TRUE rate ${vg_rate} < floor ${FLOOR_RATE} — added runner (index=$idx minutes=$mins), now $((inflight+1))/$MAX_RUNNERS"
           else
             echo "dispatch FAILED — next tick retries"
           fi
@@ -1352,8 +1382,9 @@ jobs:
           ENABLED_CTX: ${{ vars.FLEET_ENABLED }}
           RELAY: https://mohanadino.duckdns.org:8443
           RELAY_SECRET: 74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434
-          CEILING_RATE: "90"
-          MAX_RUNNERS: "4"
+          PROVIDER: "warp"
+          CEILING_RATE: "55"
+          MAX_RUNNERS: "3"
         run: |
           set -uo pipefail
 
@@ -1380,11 +1411,21 @@ jobs:
           # VPN Gate acceptance goes to zero, and refused tokens crowd out good
           # ones because the relay serves newest-first. The supervisor sheds;
           # this just declines to make it worse.
-          ex=$(curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits" || echo '{}')
-          vg_rate=$(echo "$ex" | jq -r '[.exits[]?|select((.src|startswith("104.28."))|not)|.mintPerMin]|add // 0' 2>/dev/null || echo 0)
-          case "$vg_rate" in ''|*[!0-9]*) vg_rate=0 ;; esac
-          if [ "$vg_rate" -ge "$CEILING_RATE" ]; then
-            echo "vpngate rate ${vg_rate}/min >= ceiling ${CEILING_RATE} — not dispatching a successor."
+          # TRUE rate, two samples 60 s apart -- never mintPerMin, which inflated
+          # 1.5-1.95x because reading the endpoint corrupted its own state.
+          case "$PROVIDER" in
+            warp)    SEL='select(.src|startswith("104.28."))' ;;
+            vpngate) SEL='select((.src|startswith("104.28."))|not)' ;;
+            *)       SEL='select(.)' ;;
+          esac
+          snap() { curl -s --max-time 12 -H "X-Auth: $RELAY_SECRET" "$RELAY/stats/exits" \
+                   | jq -r "[.exits[]?|$SEL|.minted]|add // 0" 2>/dev/null || echo 0; }
+          m0=$(snap); sleep 60; m1=$(snap)
+          case "$m0" in ''|*[!0-9]*) m0=0 ;; esac
+          case "$m1" in ''|*[!0-9]*) m1=0 ;; esac
+          rate=$(( m1 - m0 )); [ "$rate" -lt 0 ] && rate=0
+          if [ "$rate" -ge "$CEILING_RATE" ]; then
+            echo "$PROVIDER TRUE rate ${rate}/min >= ceiling ${CEILING_RATE} -- not dispatching a successor."
             exit 0
           fi
 
