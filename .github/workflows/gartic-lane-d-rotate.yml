@@ -198,6 +198,14 @@ on:
         description: "warp | vpngate | webshare | direct"
         required: false
         default: "warp"
+      probe_only:
+        # Bring the tunnel up, print the ADDRESS-FAMILY reality inside it, and
+        # stop. Exists because GitHub serves NO logs for an in-progress job
+        # (verified: 215 bytes while step 6 was running), so the only way to
+        # read a runner fact early is to make the job FINISH early.
+        description: "Tunnel + IPv6 diagnostics only, then exit (no browser, no minting)"
+        required: false
+        default: "false"
       rotate_min:
         # LANE D. 0 = static (the control). N = tear the VPN Gate relay down
         # every N minutes and continue on the next relay in this job's slice.
@@ -281,6 +289,7 @@ jobs:
           chromium --version || true
 
       - name: 2. Install Xvfb + a browser that still honours --load-extension
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         env:
           BROWSER: ${{ github.event.inputs.browser }}
         run: |
@@ -470,13 +479,59 @@ jobs:
           echo "TUNNELS_UP=$UP" >> "$GITHUB_ENV"
           echo "EXITIP=$(awk 'NR==1{print $3}' /tmp/tunnels.txt)" >> "$GITHUB_ENV"
 
+      - name: 3b. Address-family reality inside the tunnel
+        run: |
+          # WHY. The VM mints over IPv6 (each WARP namespace has its own v6 while
+          # they SHARE one v4), and the relay only ever records the v4 because
+          # the relay host has no usable AAAA -- so tokens are minted over v6 and
+          # attributed over v4. If a GitHub runner's WARP tunnel is v4-only, then
+          # "VM vs runner" is really "WARP v6 vs WARP v4", two address families
+          # with potentially different standing at Cloudflare, and any conclusion
+          # about AS8075 from that comparison is unfounded.
+          #
+          # Everything is measured THROUGH THE SOCKS PROXY, because that is what
+          # Chrome uses. Measuring the runner's own stack answers a different
+          # question -- WARP assigns its own v6 inside the tunnel, so a runner
+          # with no host v6 can still egress v6.
+          set +e
+          PX=$(awk 'NR==1{print $2}' /tmp/tunnels.txt)
+          echo "proxy_field=$PX"
+          if [ "$PX" = "-" ] || [ -z "$PX" ]; then
+            PXARG=(); echo "no proxy -- default route IS the tunnel"
+          else
+            PXARG=(--socks5-hostname "${PX#socks5://}")
+          fi
+          echo "=== natural family through the tunnel (what Chrome will pick) ==="
+          curl -s --max-time 25 "${PXARG[@]}" https://www.cloudflare.com/cdn-cgi/trace | sed 's/^/  nat  /'
+          echo "=== forced v4 through the tunnel ==="
+          curl -4 -s --max-time 25 "${PXARG[@]}" https://www.cloudflare.com/cdn-cgi/trace | sed -n 's/^ip=/  v4   ip=/p'
+          echo "=== forced v6 through the tunnel ==="
+          v6=$(curl -6 -s --max-time 25 "${PXARG[@]}" https://www.cloudflare.com/cdn-cgi/trace | sed -n 's/^ip=//p')
+          if [ -n "$v6" ]; then echo "  v6   ip=$v6"; else echo "  v6   NONE -- this tunnel is IPv4-ONLY"; fi
+          echo "=== the runner's OWN stack, outside the tunnel ==="
+          ip -6 addr show scope global 2>/dev/null | sed 's/^/  /' || true
+          hv6=$(curl -6 -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | sed -n 's/^ip=//p')
+          if [ -n "$hv6" ]; then echo "  host v6 ip=$hv6"; else echo "  host has NO global v6"; fi
+          echo "=== DNS families for the hosts that matter ==="
+          getent ahosts gartic.io                | awk '{print "  gartic.io    " $1}' | sort -u
+          getent ahosts challenges.cloudflare.com | awk '{print "  challenges   " $1}' | sort -u
+          getent ahosts mohanadino.duckdns.org    | awk '{print "  relay        " $1}' | sort -u
+          echo "=== VERDICT ==="
+          if [ -n "$v6" ]; then
+            echo "::notice::TUNNEL_HAS_V6 yes v6=$v6"
+          else
+            echo "::notice::TUNNEL_HAS_V6 no -- v4 only, so this runner cannot be compared like-for-like with the VM anchor"
+          fi
+
       - name: 4a. Go toolchain (joinverify needs >= the version in its go.mod)
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         uses: actions/setup-go@v5
         with:
           go-version: "stable"
           cache: false
 
       - name: 4. Build the join verifier
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/jv && cd /tmp/jv
@@ -494,6 +549,7 @@ jobs:
           fi
 
       - name: 5. Write the MV3 extension
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         env:
           LANES: ${{ github.event.inputs.lanes }}
           PER_MIN: ${{ github.event.inputs.per_min }}
@@ -881,6 +937,7 @@ jobs:
           grep -c . /tmp/ext/producer.js
 
       - name: 6. Mint
+        if: ${{ github.event.inputs.probe_only != 'true' }}
         timeout-minutes: 350
         continue-on-error: true
         env:
