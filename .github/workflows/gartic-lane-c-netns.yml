@@ -222,6 +222,18 @@ on:
         description: "VPN Gate: total number of concurrent jobs sharing the feed"
         required: false
         default: "1"
+      block_v6:
+        # openvpn's `redirect-gateway` moves IPv4 ONLY unless the server pushes
+        # v6 routes, and challenges.cloudflare.com has AAAA records that
+        # Chromium prefers under Happy Eyeballs. On a runner with native IPv6
+        # that splits the paths: the CHALLENGE egresses natively (AS8075, the
+        # ASN Cloudflare refuses) while the token POST goes through the tunnel,
+        # so the relay books a clean residential exit for a token Cloudflare
+        # issued to Azure. Set false ONLY to measure the leak; the diagnostic
+        # prints the raw trace before this is applied either way.
+        description: "Disable IPv6 inside each lane so the challenge cannot bypass the tunnel"
+        required: false
+        default: "true"
       webshare_proxy:
         # One entry, `host:port:user:pass` (the format of the proxy list files).
         description: "webshare egress: host:port:user:pass"
@@ -254,6 +266,19 @@ jobs:
         run: |
           echo "direct_egress=$(curl -4 -s --max-time 15 https://api.ipify.org || echo unknown)"
           echo "asn=$(curl -s --max-time 15 https://ipinfo.io/org || echo unknown)"
+          # `cdn-cgi/trace` reports the address CLOUDFLARE sees -- the only
+          # opinion that matters for a Turnstile challenge. ipify tells us what
+          # our IPv4 path does; this tells us what the party issuing the token
+          # thinks we are. If the runner has working IPv6 and a tunnel only
+          # redirects IPv4, the challenge can egress natively while the token
+          # POST goes through the tunnel, and per-exit attribution is a fiction.
+          echo "--- runner cdn-cgi/trace (default, Happy Eyeballs picks the family) ---"
+          curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|colo|warp)=' || echo "trace failed"
+          echo "--- runner trace forced v6 ---"
+          curl -s -6 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^ip=' || echo "no working IPv6"
+          echo "--- runner v6 routes ---"
+          ip -6 route show | head -10
+          ip -6 addr show scope global | grep -E 'inet6' | head -10 || echo "no global v6 address"
           google-chrome --version || true
           chromium --version || true
 
@@ -315,6 +340,7 @@ jobs:
           VPNGATE_INDEX: ${{ github.event.inputs.vpngate_index }}
           VPNGATE_STRIDE: ${{ github.event.inputs.vpngate_stride }}
           WEBSHARE_PROXY: ${{ github.event.inputs.webshare_proxy }}
+          BLOCK_V6: ${{ github.event.inputs.block_v6 }}
         run: |
           # `set +e` explicitly: GitHub invokes every step as `bash -e {0}` and
           # `set -uo pipefail` does NOT clear that. One tunnel failing to
@@ -368,6 +394,23 @@ jobs:
                 [ -n "$ok" ] || { echo "::error::no VPN Gate relay came up"; tail -20 /tmp/ovpn.log; exit 1; }
                 echo "vpn_egress=$ok"
                 curl -s --max-time 15 "https://ipinfo.io/${ok}/json" | tr -d '\n'; echo
+                # ---- IPv6 LEAK CHECK on the NON-netns path ------------------
+                # openvpn's redirect-gateway moves IPv4 only unless the server
+                # pushes v6 routes. If the runner has native IPv6, Chromium
+                # prefers it (Happy Eyeballs) for challenges.cloudflare.com,
+                # which has AAAA records -- so the CHALLENGE could egress from
+                # AS8075 while the token POST goes through the tunnel. That
+                # would make every per-exit acceptance figure meaningless.
+                echo "--- vpngate lane cdn-cgi/trace (what Cloudflare sees) ---"
+                curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|colo|warp)=' || echo "trace failed"
+                echo "--- forced v6 ---"
+                curl -s -6 --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^ip=' || echo "no working IPv6"
+                echo "--- v6 routes after tunnel ---"; ip -6 route show | head -8
+                if [ "${BLOCK_V6:-true}" = "true" ]; then
+                  sudo sysctl -qw net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+                  sudo sysctl -qw net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+                  echo "v6 disabled -- trace now: $(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | sed -n 's/^ip=//p')"
+                fi
                 # Default route IS the tunnel, so no --proxy-server.
                 echo "0 - $ok vpngate" >> /tmp/tunnels.txt
                 ;;
@@ -491,6 +534,31 @@ jobs:
                   cc=$(basename "$cfg" | cut -d- -f2)
                   echo "$i - $ok vg-$cc $ns" >> /tmp/tunnels.txt
                   echo "lane $i: netns=$ns exit=$ok cfg=$(basename "$cfg")"
+                  # ---- IPv6 LEAK CHECK, per lane, BEFORE any v6 policy -------
+                  # ipify tells us what our IPv4 path does. cdn-cgi/trace tells
+                  # us what CLOUDFLARE sees -- and Cloudflare is the party that
+                  # issues the token, so its opinion is the only one that can
+                  # validate attribution. If these disagree, every per-exit
+                  # acceptance number in this project is measuring the wrong IP.
+                  echo "=== lane $i LEAKCHECK (raw) ==="
+                  echo "lane $i ipify_v4=$ok"
+                  echo "lane $i trace_default:"
+                  sudo ip netns exec "$ns" curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace \
+                    | grep -E '^(ip|loc|colo|warp|sni)=' | sed "s/^/  lane $i /" || echo "  lane $i trace FAILED"
+                  echo "lane $i trace_forced_v6: $(sudo ip netns exec "$ns" curl -s -6 --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' || true)"
+                  echo "lane $i v6_routes:"
+                  sudo ip netns exec "$ns" ip -6 route show 2>/dev/null | sed "s/^/  lane $i /" | head -8
+                  echo "lane $i v6_global_addrs:"
+                  sudo ip netns exec "$ns" ip -6 addr show scope global 2>/dev/null | grep inet6 | sed "s/^/  lane $i /" | head -4
+                  if [ "${BLOCK_V6:-true}" = "true" ]; then
+                    # Defence in depth: even though this lane's veth carries no
+                    # global v6, a future topology change must not silently
+                    # reopen the leak. Namespaced sysctl, so this affects the
+                    # lane only.
+                    sudo ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
+                    sudo ip netns exec "$ns" sysctl -qw net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+                    echo "lane $i trace_after_v6_block: $(sudo ip netns exec "$ns" curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | sed -n 's/^ip=//p')"
+                  fi
                   sudo ip netns exec "$ns" curl -s --max-time 12 "https://ipinfo.io/json" | tr -d '\n'; echo
                 done
                 UPN=$(wc -l < /tmp/tunnels.txt)
@@ -1153,10 +1221,19 @@ jobs:
             # Per-lane counts inline: the whole point of this workflow is whether
             # lanes hold their own rate or steal from each other, and a run-end
             # table cannot show WHEN a lane stopped.
+            # `w=` is the LIVE Turnstile widget count from the producer's own
+            # DIAG line. It must equal `lanes`; anything above that is the
+            # non-idempotent recycle() scheduling duplicate build()s, and a
+            # browser holding hundreds of live widgets solicits challenges far
+            # faster than it mints -- which would look to Cloudflare like abuse
+            # long before it looks busy to us. Printing it per instance, every
+            # 30s, turns that from a theory into a curve.
             PER=""
             for j in "${IDX[@]}"; do
               c=$(grep -ac 'TOKFULL ' "/tmp/chrome-$j.log" 2>/dev/null); c=${c:-0}
-              PER="$PER l$j=$c($(( EL > 0 ? c * 60 / EL : 0 ))/m)"
+              w=$(grep -a 'DIAG ' "/tmp/chrome-$j.log" 2>/dev/null | tail -1 \
+                    | sed -n 's/.*lanes=\([0-9]*\).*/\1/p')
+              PER="$PER l$j=$c($(( EL > 0 ? c * 60 / EL : 0 ))/m,w=${w:-?})"
             done
             # An OOM at hour 3 is the failure this must not ship, so memory is a
             # first-class counter, not something to discover from a dead job.
@@ -1173,11 +1250,16 @@ jobs:
                 jn="${IDX[$j]}"; jns="${NSS[$j]}"
                 [ "$jns" = "-" ] && continue
                 cur=$(sudo ip netns exec "$jns" curl -4 -s --max-time 8 https://api.ipify.org 2>/dev/null)
+                # Cloudflare's own view, re-checked live: this is the address
+                # that will be attached to the next challenge, and it is the
+                # only one that can confirm the tunnel is really carrying the
+                # traffic that matters.
+                cf=$(sudo ip netns exec "$jns" curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p')
                 want=$(awk -v n="$jn" '$1==n{print $3}' /tmp/tunnels.txt)
-                if [ -n "$cur" ] && [ "$cur" = "$want" ]; then
-                  echo "[egress] l$jn ok $cur"
+                if [ -n "$cur" ] && [ "$cur" = "$want" ] && [ "$cf" = "$want" ]; then
+                  echo "[egress] l$jn ok $cur (cloudflare agrees)"
                 else
-                  echo "[egress] l$jn DRIFTED/DEAD want=$want got=${cur:-<none>}"
+                  echo "[egress] l$jn MISMATCH want=$want ipify=${cur:-<none>} cf_trace=${cf:-<none>}"
                 fi
               done
             fi
