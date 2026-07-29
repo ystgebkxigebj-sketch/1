@@ -313,6 +313,7 @@ jobs:
           GH_TOKEN: ${{ secrets.CHAIN_PAT }}
           GH_REPO: ${{ github.repository }}
           WF: gartic-lane-f-chain.yml
+          ENABLED_CTX: ${{ vars.FLEET_ENABLED }}
           RELAY: https://mohanadino.duckdns.org:8443
           RELAY_SECRET: 74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434
           # ── VPN Gate provider budget ──
@@ -332,7 +333,18 @@ jobs:
           # old value and the kill switch appears to be ignored for one whole
           # generation. Measured: switch set 15:03:23, a successor still went
           # out at 15:06:57 from a job that started 15:00:47.
-          enabled=$(gh api "repos/$GH_REPO/actions/variables/FLEET_ENABLED" --jq '.value' 2>/dev/null || echo "1")
+          # The `vars` context is the RELIABLE source: it needs no token scope and
+          # is always a clean value, but it is resolved when the JOB STARTS, so
+          # it lags by up to one job lifetime. The live API read would remove
+          # that lag -- but CHAIN_PAT is not scoped for it and returns a 403 JSON
+          # BODY ON STDOUT, which an `|| echo 1` fallback happily accepts as a
+          # value. That silently DEFEATED the kill switch (measured: it
+          # dispatched a runner while FLEET_ENABLED=0). So: trust the live value
+          # only when it is one of the known-good literals, else keep the
+          # context value. Never let an unparseable answer mean "enabled".
+          enabled="${ENABLED_CTX:-1}"
+          live=$(gh api "repos/$GH_REPO/actions/variables/FLEET_ENABLED" --jq '.value' 2>/dev/null || true)
+          case "$live" in 0|1|true|false|no|off|yes|on|TRUE|FALSE) enabled="$live" ;; esac
           case "$(echo "$enabled" | tr 'A-Z' 'a-z')" in
             0|false|no|off) STOP=1 ;; *) STOP=0 ;;
           esac
@@ -1337,6 +1349,7 @@ jobs:
           WF: gartic-lane-f-chain.yml
           REF: ${{ github.ref_name }}
           ALL_INPUTS: ${{ toJSON(github.event.inputs) }}
+          ENABLED_CTX: ${{ vars.FLEET_ENABLED }}
           RELAY: https://mohanadino.duckdns.org:8443
           RELAY_SECRET: 74b163d6448f638bc82a6c5b9a6e64f1abd06e2bca6c47c148a041a5dc40f434
           CEILING_RATE: "90"
@@ -1349,7 +1362,14 @@ jobs:
           # value and the kill switch looks ignored for a whole generation.
           # Measured: switch set 15:03:23Z, a successor still went out 15:06:57Z
           # from a job that had started at 15:00:47Z.
-          enabled=$(gh api "repos/$GH_REPO/actions/variables/FLEET_ENABLED" --jq '.value' 2>/dev/null || echo "1")
+          # See the supervisor's note: the `vars` context is authoritative and
+          # lag-bound; a live API read is used ONLY when it returns a clean
+          # literal, because CHAIN_PAT 403s with a JSON body on stdout and an
+          # `|| echo 1` fallback turns that into "enabled" and defeats the
+          # switch entirely.
+          enabled="${ENABLED_CTX:-1}"
+          live=$(gh api "repos/$GH_REPO/actions/variables/FLEET_ENABLED" --jq '.value' 2>/dev/null || true)
+          case "$live" in 0|1|true|false|no|off|yes|on|TRUE|FALSE) enabled="$live" ;; esac
           case "$(echo "$enabled" | tr 'A-Z' 'a-z')" in
             0|false|no|off)
               echo "KILL SWITCH: FLEET_ENABLED=$enabled — not dispatching a successor."
