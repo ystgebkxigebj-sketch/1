@@ -554,6 +554,13 @@ jobs:
             var LABEL = '__LABEL__';
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
+            // `built` is CUMULATIVE Turnstile widget renders = the rate at which
+            // this browser SOLICITS CHALLENGES from Cloudflare, which is not the
+            // same thing as its token output and may well be the quantity gartic
+            // and Cloudflare actually judge. `recycle()` has no in-flight guard
+            // (Lane F), so build() can be scheduled more than once per lane and
+            // this climbs superlinearly while `minted` stays flat.
+            var built = 0;
 
             function log(){ console.log.apply(console, ['[producer]'].concat([].slice.call(arguments))); }
 
@@ -566,7 +573,16 @@ jobs:
               if (!POST) { posted++; return; }
               fetch(RELAY, { method:'POST',
                 headers:{'Content-Type':'application/json','X-Auth':SECRET},
-                body: JSON.stringify({token: tok, label: LABEL})
+                // LIVE TELEMETRY, no new infrastructure. The relay stores the
+                // last label verbatim per exit and serves it on /stats/exits, so
+                // appending the live widget count and the cumulative render count
+                // turns that endpoint into a per-minute time series of the fork
+                // bomb -- readable from off-box while the job is still running,
+                // which GitHub's in-progress job logs are NOT.
+                //   w<N> = live widgets now   b<M> = widgets rendered ever
+                body: JSON.stringify({token: tok, label: LABEL
+                  + '|w' + document.querySelectorAll('[id^="prod_"]').length
+                  + 'b' + built})
               }).then(function(r){ if(r.ok){posted++;} log('posted', r.status, 'minted='+minted, 'posted='+posted); })
                 .catch(function(e){ log('relay error', e && e.message); });
             }
@@ -594,6 +610,7 @@ jobs:
             function lane(i) {
               var slot, id, sawInter;
               function build() {
+                built++;
                 sawInter = false;
                 slot = document.createElement('div');
                 slot.id = 'prod_' + i;
