@@ -77,6 +77,10 @@ on:
         description: "Dispatch a successor when this run ends"
         required: false
         default: "false"
+      supervise_now:
+        description: "Run ONE supervisor tick by hand instead of a mint job (schedule does this automatically)"
+        required: false
+        default: "false"
       forbid_exits:
         # Empty by DEFAULT and it must stay that way. WARP's IPv4 is anycast --
         # every lane shares one address (the VM's lanes all sit on
@@ -266,7 +270,11 @@ jobs:
   # `produce` workers on vars.LANE_F_TARGET and prints one health line.
   # ───────────────────────────────────────────────────────────────────────────
   supervise:
-    if: github.event_name == 'schedule'
+    # `supervise_now=true` runs a tick by hand. GitHub's cron for a newly added
+    # scheduled workflow can take a long time to fire the first time (measured:
+    # still nothing after 28 min), so without this the supervisor is untestable
+    # on the day you write it.
+    if: github.event_name == 'schedule' || github.event.inputs.supervise_now == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 6
     # A slow tick must be REPLACED, never queued behind its predecessor —
@@ -426,7 +434,7 @@ jobs:
             && echo "heartbeat -> $today" || echo "heartbeat write failed (non-fatal)"
 
   produce:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.supervise_now != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 358
 
