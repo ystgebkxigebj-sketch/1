@@ -761,11 +761,37 @@ jobs:
             }
 
             function lane(i) {
+              // Lane F's fix (98df7b59). recycle() was non-idempotent and FIVE
+              // callers could each schedule a fresh build() for the same widget
+              // generation, so live widgets grew without bound (2,577 on the VM
+              // where 2 was correct) while minting froze. `gen` invalidates every
+              // pending callback of a superseded generation; defer()/recycle()
+              // are the ONLY route back to build(). Do not add another caller.
+              var gen = 0;
+              var CAP = LANES * 3;              // hard ceiling on live widgets
               var slot, id, sawInter;
+              function purge(sel) {
+                var olds = document.querySelectorAll(sel);
+                for (var k = 0; k < olds.length; k++) {
+                  var wid = olds[k].getAttribute('data-wid');
+                  if (wid) { try { window.turnstile.remove(wid); } catch (e) {} }
+                  if (olds[k].parentNode) olds[k].parentNode.removeChild(olds[k]);
+                }
+                return olds.length;
+              }
+              function mine() { return 'div[id^="prod_' + i + '_"]'; }
               function build() {
+                var myGen = gen;
                 sawInter = false;
+                purge(mine());
+                var live = document.querySelectorAll('div[id^="prod_"]').length;
+                if (live >= CAP) {
+                  log('FORKBOMB cap=' + CAP + ' live=' + live + ' lane=' + i +
+                      ' -- purging every lane and rebuilding');
+                  purge('div[id^="prod_"]');
+                }
                 slot = document.createElement('div');
-                slot.id = 'prod_' + i;
+                slot.id = 'prod_' + i + '_' + myGen;
                 // The class off-the-shelf Turnstile helpers look for. Our own
                 // driver finds the widget by rect and does not need it, but a
                 // bench measured stock helpers at 3/3 on a classed widget and
@@ -778,13 +804,14 @@ jobs:
                   id = window.turnstile.render(slot, {
                     sitekey: KEY, action: 'join', appearance: APPEARANCE,
                     callback: function(){},
-                    'error-callback': function(c){ log('cf err', c); setTimeout(recycle, 2000); },
+                    'error-callback': function(c){ log('cf err', c); defer(myGen, 2000); },
                     'before-interactive-callback': function(){ sawInter = true; log('BEFORE_INTERACTIVE (lane '+i+')'); },
                     'after-interactive-callback': function(){ log('AFTER_INTERACTIVE (lane '+i+')'); },
-                    'timeout-callback': function(){ recycle(); }
+                    'timeout-callback': function(){ defer(myGen, 0); }
                   });
-                } catch (e) { log('render threw', e && e.message); setTimeout(recycle, 3000); return; }
-                poll(0);
+                  slot.setAttribute('data-wid', String(id));
+                } catch (e) { log('render threw', e && e.message); defer(myGen, 3000); return; }
+                poll(0, myGen);
               }
               function read() {
                 try { var t = window.turnstile.getResponse(id); if (t) return t; } catch(e){}
@@ -824,7 +851,8 @@ jobs:
                 }
                 log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy + ' dpr=' + p.dpr);
               }
-              function poll(n) {
+              function poll(n, myGen) {
+                if (myGen !== gen) return;      // a stale chain must die, not recycle
                 var t = read();
                 if (t) {
                   var now = Date.now();
@@ -834,17 +862,26 @@ jobs:
                   log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16), 'solve='+(sawInter?'int':'auto'));
                   log('TOKFULL ' + (sawInter ? 'int' : 'auto') + ' ' + t);
                   setTimeout(function(){ post(t); }, wait);
-                  setTimeout(recycle, wait + 500);
+                  defer(myGen, wait + 500);
                   return;
                 }
-                if (n > 60) { recycle(); return; }
+                if (n > 60) { defer(myGen, 0); return; }
                 if (n % 5 === 2) emitClick();
-                setTimeout(function(){ poll(n+1); }, 1000);
+                setTimeout(function(){ poll(n+1, myGen); }, 1000);
               }
-              function recycle() {
+              // defer()/recycle() are the ONLY route back to build().
+              // Do not add another caller -- that is exactly how this happened.
+              function defer(myGen, ms) {
+                if (myGen !== gen) return;
+                setTimeout(function(){ recycle(myGen); }, ms);
+              }
+              function recycle(myGen) {
+                if (myGen !== gen) return;      // someone already recycled this gen
+                gen++;                          // invalidates every pending callback
                 try { window.turnstile.remove(id); } catch(e){}
-                if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
-                setTimeout(build, 300);
+                purge(mine());
+                slot = null; id = null;
+                setTimeout(build, 400);
               }
               return build;
             }
@@ -1238,6 +1275,8 @@ jobs:
             # An OOM at hour 3 is the failure this must not ship, so memory is a
             # first-class counter, not something to discover from a dead job.
             MEM=$(free -m | awk '/^Mem:/{printf "used=%dM avail=%dM", $3, $7}')
+            # If the generation guard is ever defeated this fires; it must stay 0.
+            FB=$(sum_over 'FORKBOMB cap='); [ "${FB:-0}" -gt 0 ] && MEM="$MEM FORKBOMB=$FB"
             echo "[summary] t=${EL}s minted=$MINTED rate=${RATE}/min clicks=$CLICKS alive=$alive/$NINST $MEM |$PER"
 
             # Every ~5 min, re-check each lane's ACTUAL egress from inside its
@@ -1377,8 +1416,28 @@ jobs:
           GH_TOKEN: ${{ secrets.CHAIN_PAT }}
           GH_REPO: ${{ github.repository }}
         run: |
+          # `gh workflow run <wf> -f chain=true` passes ONLY chain, so the
+          # successor reverts every other input to its DEFAULT -- a VPN Gate
+          # netns worker would chain into a single-tunnel WARP successor and
+          # lose its vpngate_index, per_min, minutes and lanes with it. No
+          # chained generation this project has ever run was configured like
+          # its parent. Forward the whole input set.
           for attempt in 1 2 3 4 5; do
-            if gh workflow run gartic-lane-c-netns.yml -f chain=true; then
+            if gh workflow run gartic-lane-c-netns.yml -f chain=true \
+                 -f egress='${{ github.event.inputs.egress }}' \
+                 -f tunnels='${{ github.event.inputs.tunnels }}' \
+                 -f lanes='${{ github.event.inputs.lanes }}' \
+                 -f per_min='${{ github.event.inputs.per_min }}' \
+                 -f minutes='${{ github.event.inputs.minutes }}' \
+                 -f vpngate_index='${{ github.event.inputs.vpngate_index }}' \
+                 -f vpngate_stride='${{ github.event.inputs.vpngate_stride }}' \
+                 -f block_v6='${{ github.event.inputs.block_v6 }}' \
+                 -f strip_dom='${{ github.event.inputs.strip_dom }}' \
+                 -f click_style='${{ github.event.inputs.click_style }}' \
+                 -f appearance='${{ github.event.inputs.appearance }}' \
+                 -f browser='${{ github.event.inputs.browser }}' \
+                 -f verify_every='${{ github.event.inputs.verify_every }}' \
+                 -f post_to_relay='${{ github.event.inputs.post_to_relay }}'; then
               echo "successor dispatched on attempt $attempt"; exit 0
             fi
             sleep $((attempt * 5))
