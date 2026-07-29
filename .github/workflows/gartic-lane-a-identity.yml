@@ -442,9 +442,15 @@ jobs:
             v4=$(sed -n 's/^exit_v4=//p' "$d/out.txt" | tail -1)
             v6=$(sed -n 's/^exit_ip=//p'  "$d/out.txt" | tail -1)
             colo=$(sed -n 's/^colo=//p'   "$d/out.txt" | tail -1)
+            # warp_up.sh's stdout goes to out.txt and was surfaced ONLY on
+            # failure, so a successful run never said whether it had registered
+            # a fresh device or reused an injected one -- which makes an
+            # aged-vs-fresh A/B unfalsifiable, because "both arms scored the
+            # same" is also exactly what a silently-unplumbed input looks like.
+            imode=$(sed -n 's/^identity=//p' "$d/out.txt" | tail -1)
             if [ -n "$v4" ] && [ "$v4" != "none" ] && [ "$v4" != "FAILED" ]; then
               echo "$n socks5://127.0.0.1:$port $v4 ${colo:-unknown}" >> /tmp/tunnels.txt
-              echo "tunnel $n  port=$port  exit=$v4  colo=${colo:-unknown}  v6=${v6:-none}"
+              echo "tunnel $n  port=$port  exit=$v4  colo=${colo:-unknown}  v6=${v6:-none}  identity=${imode:-unknown}"
             else
               echo "tunnel $n FAILED to register (rc=$rc) -- continuing with fewer"
               # Every roll line, so a failure says whether it was collisions with
