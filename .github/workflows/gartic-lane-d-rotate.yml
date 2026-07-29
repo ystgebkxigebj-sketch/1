@@ -210,6 +210,27 @@ on:
         description: "Rotate the vpngate exit every N minutes (0 = static control)"
         required: false
         default: "0"
+      rotate_every:
+        # THE CONFOUND CONTROL, and the reason this lane needs only one runner.
+        #
+        # Rotating the exit also RESTARTS Chromium, and producer.js is a
+        # self-amplifying widget fork bomb (Lane F: `recycle()` has no in-flight
+        # guard and every mint schedules another `build()`, so widget count
+        # climbs ~1.2/s and minting freezes ~40 min in). A rotating runner
+        # therefore gets a free producer reset every tenure that a static one
+        # never gets -- so "rotator sustained, static collapsed" would be a
+        # browser-restart result masquerading as an exit-rotation result.
+        #
+        # rotate_every=N restarts the browser EVERY tenure but only swaps the
+        # exit every Nth one. Browser hygiene is then identical across tenures
+        # and the ONLY thing that differs between block 1 and block N on an exit
+        # is the exit's age. That is a PAIRED, within-runner comparison: immune
+        # to relay-quality variance (two parallel runners always sit on two
+        # different-quality volunteer lines) and to the ~15-min acceptance drift
+        # that makes any across-time comparison provisional.
+        description: "Swap the exit every Nth tenure; the others restart the browser only (1 = always swap)"
+        required: false
+        default: "1"
       vpngate_index:
         # Job K of N passes index=K stride=N so concurrent runners take disjoint
         # relays. Without it every runner ranks the feed identically, all pick the
@@ -812,6 +833,7 @@ jobs:
           CLICK_STYLE: ${{ github.event.inputs.click_style }}
           APPEARANCE: ${{ github.event.inputs.appearance }}
           ROTATE_MIN: ${{ github.event.inputs.rotate_min }}
+          ROTATE_EVERY: ${{ github.event.inputs.rotate_every }}
           EGRESS: ${{ github.event.inputs.egress }}
           VPNGATE_INDEX: ${{ github.event.inputs.vpngate_index }}
           VPNGATE_STRIDE: ${{ github.event.inputs.vpngate_stride }}
@@ -845,6 +867,7 @@ jobs:
           VERIFY_EVERY="${VERIFY_EVERY:-180}"
           CLICK_STYLE="${CLICK_STYLE:-human}"
           ROTATE_MIN="${ROTATE_MIN:-0}"
+          ROTATE_EVERY="${ROTATE_EVERY:-1}"
           MYRUN="gh-${GITHUB_RUN_ID:-unknown}"
           echo "click style: $CLICK_STYLE   rotate_min: $ROTATE_MIN min"
           mapfile -t TUNS < /tmp/tunnels.txt
@@ -1119,16 +1142,24 @@ jobs:
           RUN_START=$(date +%s)
           END=$(( RUN_START + MINUTES * 60 ))
           verified=0; accepted=0; lastcheck=0; vturn=0
-          tenure=0; CUM_MINTED=0; ROT_SECS=0
+          tenure=0; CUM_MINTED=0; ROT_SECS=0; EXIT_BLOCK=0
           : > /tmp/tenures.txt
 
           while [ "$(date +%s)" -lt "$END" ]; do
             if [ "$tenure" -gt 0 ] && [ "$ROTATE_MIN" -gt 0 ]; then
-              r0=$(date +%s)
-              rotate_tunnel || { echo "[rotate] giving up -- ending run at tenure $tenure"; break; }
-              r1=$(date +%s)
-              ROT_SECS=$(( ROT_SECS + r1 - r0 ))
-              echo "[rotate] handover took $(( r1 - r0 ))s (cumulative ${ROT_SECS}s)"
+              if [ "$ROTATE_EVERY" -le 1 ] || [ $(( tenure % ROTATE_EVERY )) -eq 0 ]; then
+                r0=$(date +%s)
+                rotate_tunnel || { echo "[rotate] giving up -- ending run at tenure $tenure"; break; }
+                r1=$(date +%s)
+                ROT_SECS=$(( ROT_SECS + r1 - r0 ))
+                echo "[rotate] handover took $(( r1 - r0 ))s (cumulative ${ROT_SECS}s)"
+                EXIT_BLOCK=0
+              else
+                # Paired control tenure: same exit, fresh browser. Everything
+                # the rotation does EXCEPT move the exit.
+                EXIT_BLOCK=$(( EXIT_BLOCK + 1 ))
+                echo "[rotate] tenure $tenure: BROWSER RESTART ONLY, exit unchanged (block $EXIT_BLOCK on this exit)"
+              fi
             fi
 
             if [ "$ROTATE_MIN" -gt 0 ]; then LBL="${MYRUN}-r${tenure}"; else LBL="$MYRUN"; fi
@@ -1138,7 +1169,7 @@ jobs:
             if [ "$ROTATE_MIN" -gt 0 ]; then tend=$(( tstart + ROTATE_MIN * 60 )); else tend=$END; fi
             [ "$tend" -gt "$END" ] && tend=$END
             echo "=============================================="
-            echo "[tenure] n=$tenure exit=$TEXIT label=$LBL start=$tstart planned_end=$tend"
+            echo "[tenure] n=$tenure exit=$TEXIT block=$EXIT_BLOCK label=$LBL start=$tstart planned_end=$tend"
             echo "=============================================="
 
             if ! start_instances; then
