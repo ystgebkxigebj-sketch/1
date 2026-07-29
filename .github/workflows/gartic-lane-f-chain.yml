@@ -441,8 +441,13 @@ jobs:
           ceiling="$CEILING_RATE"; [ -n "$GLOBAL_CEILING" ] && ceiling="$GLOBAL_CEILING"
           vg_rate="$rate"
 
-          inflight=$(gh run list -w "$WF" -L 100 --json status,event \
-            --jq '[.[]|select(.event=="workflow_dispatch" and (.status=="in_progress" or .status=="queued"))]|length' 2>/dev/null || echo 0)
+          # EXCLUDE THIS RUN. A supervise_now tick is itself a workflow_dispatch,
+          # so without this the supervisor counts ITSELF as a worker -- it
+          # reported runners=1/3 with 0 attributable verdicts and sat in
+          # "evaluating" instead of probing. The scheduled path never hit this
+          # (its event is "schedule"), which is why the manual tick was worth running.
+          inflight=$(gh run list -w "$WF" -L 100 --json status,event,databaseId \
+            --jq "[.[]|select(.event==\"workflow_dispatch\" and (.status==\"in_progress\" or .status==\"queued\") and (.databaseId != ${GITHUB_RUN_ID}))]|length" 2>/dev/null || echo 0)
           case "$inflight" in ''|*[!0-9]*) inflight=0 ;; esac
           allq=$(gh run list -L 100 --json status --jq '[.[]|select(.status=="queued")]|length' 2>/dev/null || echo 0)
           case "$allq" in ''|*[!0-9]*) allq=0 ;; esac
@@ -508,7 +513,7 @@ jobs:
           # anchor never fell; its statistic did. Use per-exit cumulative
           # joined/refused, which the relay attributes by token -> minting exit.
           mine=$(gh run list -w "$WF" -L 100 --json databaseId,event,status \
-            --jq '[.[]|select(.event=="workflow_dispatch" and (.status=="in_progress" or .status=="queued"))|.databaseId|tostring]|join(" ")' 2>/dev/null || echo "")
+            --jq "[.[]|select(.event==\"workflow_dispatch\" and (.status==\"in_progress\" or .status==\"queued\") and (.databaseId != ${GITHUB_RUN_ID}))|.databaseId|tostring]|join(\" \")" 2>/dev/null || echo "")
 
           gh_j=0; gh_r=0
           for rid in $mine; do
@@ -532,8 +537,13 @@ jobs:
           # Cooldown after a refusal, derived from the last finished worker so
           # that no state has to be stored anywhere.
           cool=0
-          last_end=$(gh run list -w "$WF" -L 50 --json event,status,updatedAt \
-            --jq '[.[]|select(.event=="workflow_dispatch" and .status=="completed")]|sort_by(.updatedAt)|last|.updatedAt // empty' 2>/dev/null || echo "")
+          # Only a REAL worker starts a cooldown. A supervise_now tick is also a
+          # completed workflow_dispatch, and counting it put the lane into a
+          # 25-minute cooldown nothing had earned. Workers run for minutes; a tick
+          # finishes in ~60-90 s (it sleeps 60 s to measure a true rate), so filter
+          # on duration.
+          last_end=$(gh run list -w "$WF" -L 50 --json event,status,createdAt,updatedAt \
+            --jq "[.[]|select(.event==\"workflow_dispatch\" and .status==\"completed\")|select(((.updatedAt|fromdateiso8601) - (.createdAt|fromdateiso8601)) > 240)]|sort_by(.updatedAt)|last|.updatedAt // empty" 2>/dev/null || echo "")
           if [ -n "$last_end" ]; then
             since=$(( $(date -u +%s) - $(date -u -d "$last_end" +%s 2>/dev/null || echo 0) ))
             [ "$since" -lt $(( RETRY_MIN * 60 )) ] && cool=$(( (RETRY_MIN * 60 - since + 59) / 60 ))
