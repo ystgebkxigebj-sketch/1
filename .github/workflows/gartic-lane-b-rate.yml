@@ -135,6 +135,16 @@ on:
         description: "Seconds between acceptance checks. Lower = more samples, costs one token each."
         required: false
         default: "180"
+      recycle_fix:
+        # Lane F root-caused the producer stall: recycle() is non-idempotent
+        # and several callers can each schedule a fresh build() for the same
+        # widget generation, so live widgets multiply while `minted` freezes.
+        # This input exists so the FIXED and UNFIXED arms of the controlled
+        # comparison run from ONE workflow file and are therefore identical in
+        # every other respect. false = reproduce the bomb on purpose.
+        description: "Apply Lane F's recycle idempotency guard (false = reproduce the fork bomb, control arm only)"
+        required: false
+        default: "true"
       strip_dom:
         # Throughput on a runner is CPU-bound (3 and 5 tunnels both total
         # 27/min), and most of that CPU is gartic's animated Next.js homepage,
@@ -463,6 +473,7 @@ jobs:
           STRIP_DOM: ${{ github.event.inputs.strip_dom }}
           ROTATE_FP: ${{ github.event.inputs.rotate_fp }}
           RECYCLE_MIN: ${{ github.event.inputs.recycle_min }}
+          RECYCLE_FIX: ${{ github.event.inputs.recycle_fix }}
           APPEARANCE: ${{ github.event.inputs.appearance }}
         run: |
           set -euo pipefail
@@ -514,8 +525,19 @@ jobs:
             var RECYCLE_MIN = __RECYCLE__;
             var APPEARANCE = '__APPEARANCE__';
             var LABEL = '__LABEL__';
+            var RECYCLE_FIX = __RECYCLE_FIX__;
             var GAP = Math.round(60000 / PER_MIN);
             var nextAllowed = 0, minted = 0, posted = 0;
+            // LANE B TELEMETRY. GitHub serves no logs for a running job and the
+            // DIAG line only reaches the job log when a run mints ZERO, so the
+            // relay label is the only live channel for these counters.
+            var renders = 0, T0 = Date.now();
+            function tag() {
+              var w = 0;
+              try { w = document.querySelectorAll('[id^="prod_"]').length; } catch(e){}
+              return LABEL + '-r' + Math.round((Date.now() - T0) / 60000) +
+                     '|w' + w + 'b' + renders + 'm' + minted;
+            }
 
             function log(){ console.log.apply(console, ['[producer]'].concat([].slice.call(arguments))); }
 
@@ -528,7 +550,7 @@ jobs:
               if (!POST) { posted++; return; }
               fetch(RELAY, { method:'POST',
                 headers:{'Content-Type':'application/json','X-Auth':SECRET},
-                body: JSON.stringify({token: tok, label: LABEL})
+                body: JSON.stringify({token: tok, label: tag()})
               }).then(function(r){ if(r.ok){posted++;} log('posted', r.status, 'minted='+minted, 'posted='+posted); })
                 .catch(function(e){ log('relay error', e && e.message); });
             }
@@ -554,11 +576,34 @@ jobs:
             }
 
             function lane(i) {
+              var gen = 0;
+              var CAP = LANES * 3;              // hard ceiling on live widgets
               var slot, id, sawInter;
+              function purge(sel) {
+                var olds = document.querySelectorAll(sel);
+                for (var k = 0; k < olds.length; k++) {
+                  var wid = olds[k].getAttribute('data-wid');
+                  if (wid) { try { window.turnstile.remove(wid); } catch (e) {} }
+                  if (olds[k].parentNode) olds[k].parentNode.removeChild(olds[k]);
+                }
+                return olds.length;
+              }
+              function mine() { return 'div[id^="prod_' + i + '_"]'; }
               function build() {
+                var myGen = gen;
+                renders++;                      // Lane B telemetry: challenges solicited
                 sawInter = false;
+                if (RECYCLE_FIX) {
+                  purge(mine());
+                  var live = document.querySelectorAll('div[id^="prod_"]').length;
+                  if (live >= CAP) {
+                    log('FORKBOMB cap=' + CAP + ' live=' + live + ' lane=' + i +
+                        ' -- purging every lane and rebuilding');
+                    purge('div[id^="prod_"]');
+                  }
+                }
                 slot = document.createElement('div');
-                slot.id = 'prod_' + i;
+                slot.id = 'prod_' + i + '_' + myGen;
                 // The class off-the-shelf Turnstile helpers look for. Our own
                 // driver finds the widget by rect and does not need it, but a
                 // bench measured stock helpers at 3/3 on a classed widget and
@@ -571,13 +616,14 @@ jobs:
                   id = window.turnstile.render(slot, {
                     sitekey: KEY, action: 'join', appearance: APPEARANCE,
                     callback: function(){},
-                    'error-callback': function(c){ log('cf err', c); setTimeout(recycle, 2000); },
+                    'error-callback': function(c){ log('cf err', c); defer(myGen, 2000); },
                     'before-interactive-callback': function(){ sawInter = true; log('BEFORE_INTERACTIVE (lane '+i+')'); },
                     'after-interactive-callback': function(){ log('AFTER_INTERACTIVE (lane '+i+')'); },
-                    'timeout-callback': function(){ recycle(); }
+                    'timeout-callback': function(){ defer(myGen, 0); }
                   });
-                } catch (e) { log('render threw', e && e.message); setTimeout(recycle, 3000); return; }
-                poll(0);
+                  slot.setAttribute('data-wid', String(id));
+                } catch (e) { log('render threw', e && e.message); defer(myGen, 3000); return; }
+                poll(0, myGen);
               }
               function read() {
                 try { var t = window.turnstile.getResponse(id); if (t) return t; } catch(e){}
@@ -617,7 +663,8 @@ jobs:
                 }
                 log('CLICKAT lane=' + i + ' x=' + cx + ' y=' + cy + ' dpr=' + p.dpr);
               }
-              function poll(n) {
+              function poll(n, myGen) {
+                if (myGen !== gen) return;      // a stale chain must die, not recycle
                 var t = read();
                 if (t) {
                   var now = Date.now();
@@ -627,17 +674,31 @@ jobs:
                   log('TOKEN lane'+i, 'len='+t.length, 'head='+t.slice(0,16), 'solve='+(sawInter?'int':'auto'));
                   log('TOKFULL ' + (sawInter ? 'int' : 'auto') + ' ' + t);
                   setTimeout(function(){ post(t); }, wait);
-                  setTimeout(recycle, wait + 500);
+                  defer(myGen, wait + 500);
                   return;
                 }
-                if (n > 60) { recycle(); return; }
+                if (n > 60) { defer(myGen, 0); return; }
                 if (n % 5 === 2) emitClick();
-                setTimeout(function(){ poll(n+1); }, 1000);
+                setTimeout(function(){ poll(n+1, myGen); }, 1000);
               }
-              function recycle() {
+              // defer()/recycle() are the ONLY route back to build().
+              // Do not add another caller -- that is exactly how this happened.
+              function defer(myGen, ms) {
+                if (myGen !== gen) return;
+                setTimeout(function(){ recycle(myGen); }, ms);
+              }
+              function recycle(myGen) {
+                if (myGen !== gen) return;      // someone already recycled this gen
+                if (RECYCLE_FIX) gen++;         // invalidates every pending callback
                 try { window.turnstile.remove(id); } catch(e){}
-                if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
-                setTimeout(build, 300);
+                if (RECYCLE_FIX) {
+                  purge(mine());
+                  slot = null; id = null;
+                  setTimeout(build, 400);
+                } else {
+                  if (slot && slot.parentNode) slot.parentNode.removeChild(slot);
+                  setTimeout(build, 300);
+                }
               }
               return build;
             }
@@ -777,7 +838,9 @@ jobs:
           RECJS="${RECYCLE_MIN:-0}"
           APPJS="${APPEARANCE:-interaction-only}"
           LABELJS="gh-${GITHUB_RUN_ID:-unknown}"
-          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|; s|__LABEL__|$LABELJS|" /tmp/ext/producer.js
+          if [ "${RECYCLE_FIX:-true}" = "true" ]; then RFJS=true; else RFJS=false; fi
+          echo "recycle_fix=$RFJS"
+          sed -i "s|__RELAY__|$RELAY|; s|__SECRET__|$AUTH_SECRET|; s|__SITEKEY__|$SITEKEY|; s|__LANES__|$LANES|; s|__PER_MIN__|$PER_MIN|; s|__POST__|$POSTJS|; s|__STRIP__|$STRIPJS|; s|__ROTATE__|$ROTJS|; s|__RECYCLE__|$RECJS|; s|__APPEARANCE__|$APPJS|; s|__LABEL__|$LABELJS|; s|__RECYCLE_FIX__|$RFJS|" /tmp/ext/producer.js
           echo "rotate_fp=$ROTJS recycle_min=$RECJS"
           grep -c . /tmp/ext/producer.js
 
